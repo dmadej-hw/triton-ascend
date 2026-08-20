@@ -430,6 +430,38 @@ std::optional<int64_t> findAxisDimension(Operation *searchRoot,
   return extractMulIConstant(cast<arith::MulIOp>(mulI));
 }
 
+// Fallback for findAxisDimension when there is no tt.expand_dims to anchor
+// on at all: a kernel that processes one row per scf.for iteration (see
+// graph-optimize-gather-scalar-row.mlir) can compute that row's entire
+// source offset as a plain scalar (e.g. "(program_id*tile+%rb) * 1024"),
+// broadcasting it to the tile shape with a single tt.splat instead of
+// building it up axis by axis with tt.expand_dims/tt.broadcast. In that
+// shape there is nothing for findAxisDimension's tt.expand_dims anchor to
+// find, but the axis's dimension is still recoverable: it is simply the
+// constant multiplied somewhere in that scalar chain. Callers must only use
+// this when exactly one axis remains unresolved (checked by requiring
+// searchRoot's own classification to already be scalar, i.e. rank 0 -- see
+// the call site), since nothing here distinguishes which axis a multiplier
+// belongs to the way tt.expand_dims does.
+std::optional<int64_t> findScalarAxisDimension(Operation *searchRoot,
+                                               Operation *indicesOp) {
+  std::function<bool(Operation *)> isMulIWithConstant =
+      [](Operation *op) -> bool {
+    auto mulI = dyn_cast<arith::MulIOp>(op);
+    return mulI && (mulI.getLhs().getDefiningOp<arith::ConstantOp>() ||
+                    mulI.getRhs().getDefiningOp<arith::ConstantOp>());
+  };
+  std::function<bool(Operation *)> leavesSourceRegion =
+      [&](Operation *op) -> bool {
+    return op == indicesOp || isSplatOfBlockArgPointer(op);
+  };
+  Operation *mulI = findOperandDefinitionWithCondition(
+      searchRoot->getResult(0), isMulIWithConstant, leavesSourceRegion);
+  if (!mulI)
+    return std::nullopt;
+  return extractMulIConstant(cast<arith::MulIOp>(mulI));
+}
+
 // Read-only counterpart of the former GatherOptimizationConversionPattern::
 // analyze(): identical matching rules, but classification comes from
 // ReadOnlyOffsetClassifier instead of the mutating OffsetAnalysis::parse, and
@@ -570,6 +602,15 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp) {
     }
     std::optional<int64_t> dim =
         findAxisDimension(srcAnalysisStart, indicesOp, axis);
+    if (!dim && candidate.indexRank == 2 &&
+        classifier.classify(srcAnalysisStart->getResult(0)).getRank() == 0) {
+      // srcAnalysisStart itself classified scalar (rank 0): with axis 0
+      // already handled above, axis is the only one left to resolve, so
+      // there is no ambiguity in falling back to "any constant multiplier
+      // reachable from here" even though it cannot itself distinguish
+      // axes -- see findScalarAxisDimension's comment.
+      dim = findScalarAxisDimension(srcAnalysisStart, indicesOp);
+    }
     if (!dim) {
       LLVM_DEBUG(llvm::dbgs() << "[GatherOptimization] could not recover "
                                  "source dimension for axis "
