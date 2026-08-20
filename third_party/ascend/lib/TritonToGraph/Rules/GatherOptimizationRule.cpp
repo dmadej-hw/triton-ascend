@@ -432,19 +432,38 @@ std::optional<int64_t> findAxisDimension(Operation *searchRoot,
 
 // Fallback for findAxisDimension when there is no tt.expand_dims to anchor
 // on at all: a kernel that processes one row per scf.for iteration (see
-// graph-optimize-gather-scalar-row.mlir) can compute that row's entire
-// source offset as a plain scalar (e.g. "(program_id*tile+%rb) * 1024"),
-// broadcasting it to the tile shape with a single tt.splat instead of
-// building it up axis by axis with tt.expand_dims/tt.broadcast. In that
-// shape there is nothing for findAxisDimension's tt.expand_dims anchor to
-// find, but the axis's dimension is still recoverable: it is simply the
-// constant multiplied somewhere in that scalar chain. Callers must only use
-// this when exactly one axis remains unresolved (checked by requiring
-// searchRoot's own classification to already be scalar, i.e. rank 0 -- see
-// the call site), since nothing here distinguishes which axis a multiplier
-// belongs to the way tt.expand_dims does.
-std::optional<int64_t> findScalarAxisDimension(Operation *searchRoot,
-                                               Operation *indicesOp) {
+// graph-optimize-gather-scalar-row.mlir) can compute axis 1's entire
+// absolute position as "(row counter) * axis1_size + local_position",
+// splatting the scaled row counter directly instead of building axis 1 up
+// with tt.expand_dims/tt.broadcast the way later axes are. In that shape
+// there is no tt.expand_dims for findAxisDimension's anchor to find, but the
+// dimension is still recoverable: it is simply the constant multiplied by
+// the row counter in that one arith.muli.
+//
+// That same arith.muli's *other* operand -- the row counter itself, still
+// unscaled by axis1_size -- is also exactly this rule's rowOffset (see the
+// call site). Returning it here, rather than making the caller re-derive it
+// with a second, independent search, matters for correctness, not just
+// convenience: a generic "first rank-0 value reachable from
+// srcAnalysisStart" search (which is what finds rowOffset when this fallback
+// is not needed -- see further down) would, in this exact shape, find this
+// arith.muli's *scaled* result first, since it sits strictly closer to
+// srcAnalysisStart than the unscaled row counter beneath it. Tying rowOffset
+// to specifically the operand this axis's own dimension came from is what
+// keeps the two consistent with each other.
+//
+// Only used for axis 1: it is the one axis structurally adjacent to axis 0,
+// which is never itself built from tt.expand_dims (its dimension always
+// comes directly from the indices' own shape -- see the call site), so it is
+// the one place a bare "row counter" can plausibly stand in for what would
+// otherwise be a tt.expand_dims-anchored axis.
+struct ScalarAxisMatch {
+  int64_t dimension;
+  Value carrier; // The row counter this axis's dimension scales.
+};
+
+std::optional<ScalarAxisMatch> findScalarAxisDimension(Operation *searchRoot,
+                                                        Operation *indicesOp) {
   std::function<bool(Operation *)> isMulIWithConstant =
       [](Operation *op) -> bool {
     auto mulI = dyn_cast<arith::MulIOp>(op);
@@ -455,11 +474,18 @@ std::optional<int64_t> findScalarAxisDimension(Operation *searchRoot,
       [&](Operation *op) -> bool {
     return op == indicesOp || isSplatOfBlockArgPointer(op);
   };
-  Operation *mulI = findOperandDefinitionWithCondition(
+  Operation *mulIOp = findOperandDefinitionWithCondition(
       searchRoot->getResult(0), isMulIWithConstant, leavesSourceRegion);
-  if (!mulI)
+  if (!mulIOp)
     return std::nullopt;
-  return extractMulIConstant(cast<arith::MulIOp>(mulI));
+  auto mulI = cast<arith::MulIOp>(mulIOp);
+  std::optional<int64_t> dim = extractMulIConstant(mulI);
+  if (!dim)
+    return std::nullopt;
+  Value carrier = mulI.getRhs().getDefiningOp<arith::ConstantOp>()
+                      ? mulI.getLhs()
+                      : mulI.getRhs();
+  return ScalarAxisMatch{*dim, carrier};
 }
 
 // Read-only counterpart of the former GatherOptimizationConversionPattern::
@@ -595,6 +621,7 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp) {
   // shape, not reconstructed from arithmetic -- it is paired with rowOffset,
   // recovered separately below, exactly as the codegen expects.
   candidate.srcShape.push_back(indexShape[0]);
+  std::optional<Value> scalarRowCarrier;
   for (int axis = 1; axis < candidate.indexRank; axis++) {
     if (axis < baseInfo.getRank() && baseStructured[axis] == AxisInfo::scalar) {
       candidate.srcShape.push_back(1);
@@ -602,14 +629,12 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp) {
     }
     std::optional<int64_t> dim =
         findAxisDimension(srcAnalysisStart, indicesOp, axis);
-    if (!dim && candidate.indexRank == 2 &&
-        classifier.classify(srcAnalysisStart->getResult(0)).getRank() == 0) {
-      // srcAnalysisStart itself classified scalar (rank 0): with axis 0
-      // already handled above, axis is the only one left to resolve, so
-      // there is no ambiguity in falling back to "any constant multiplier
-      // reachable from here" even though it cannot itself distinguish
-      // axes -- see findScalarAxisDimension's comment.
-      dim = findScalarAxisDimension(srcAnalysisStart, indicesOp);
+    if (!dim && axis == 1) {
+      if (std::optional<ScalarAxisMatch> scalarMatch =
+              findScalarAxisDimension(srcAnalysisStart, indicesOp)) {
+        dim = scalarMatch->dimension;
+        scalarRowCarrier = scalarMatch->carrier;
+      }
     }
     if (!dim) {
       LLVM_DEBUG(llvm::dbgs() << "[GatherOptimization] could not recover "
@@ -628,26 +653,39 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp) {
       return std::nullopt;
   }
 
-  // Find the first (nearest) scalar (rank-0) value feeding srcAnalysisStart:
-  // in a tiled kernel this is normally "program_id * tile_size", the tile's
-  // row start, which is exactly what row 0 of the grid built below needs to
-  // be offset by.
-  //
-  // This deliberately does NOT exclude arith::MulIOp results, unlike the
-  // pattern this rule replaced. That exclusion looked past a scalar like
-  // "program_id * tile_size" to the raw, un-scaled program_id underneath it
-  // whenever nothing else (e.g. a loop induction variable added on top, as
-  // in graph-optimize-gather.mlir's looped kernel) intervened first --
-  // silently using the wrong row offset for any single-shot (non-looped)
-  // tile whose row start is a bare multiplication, which is the common case.
-  // A rank-0 MulI result is exactly as valid a row offset as any other
-  // rank-0 value; nothing here needs it to be one specific op kind.
-  std::function<bool(Operation *)> isRank0 = [&](Operation *op) -> bool {
-    return classifier.classify(op->getResult(0)).getRank() == 0;
-  };
-  if (Operation *rank0 =
-          findPrecedingOpWithCondition(srcAnalysisStart, isRank0, stopIndices))
+  if (scalarRowCarrier) {
+    // Axis 1's dimension came from findScalarAxisDimension: its carrier
+    // *is* rowOffset (see that function's comment for why this must be tied
+    // to the same arith.muli axis 1's dimension came from, rather than
+    // re-derived independently below).
+    candidate.rowOffset = *scalarRowCarrier;
+  } else if (Operation *rank0 = findPrecedingOpWithCondition(
+                 srcAnalysisStart,
+                 [&](Operation *op) {
+                   return classifier.classify(op->getResult(0)).getRank() ==
+                          0;
+                 },
+                 stopIndices)) {
+    // Find the first (nearest) scalar (rank-0) value feeding
+    // srcAnalysisStart: in a tiled kernel this is normally
+    // "program_id * tile_size", the tile's row start, which is exactly what
+    // row 0 of the grid built below needs to be offset by.
+    //
+    // This deliberately does NOT exclude arith::MulIOp results, unlike the
+    // pattern this rule replaced. That exclusion looked past a scalar like
+    // "program_id * tile_size" to the raw, un-scaled program_id underneath
+    // it whenever nothing else (e.g. a loop induction variable added on top,
+    // as in graph-optimize-gather.mlir's looped kernel) intervened first --
+    // silently using the wrong row offset for any single-shot (non-looped)
+    // tile whose row start is a bare multiplication, which is the common
+    // case. A rank-0 MulI result is exactly as valid a row offset as any
+    // other rank-0 value; nothing here needs it to be one specific op kind.
+    // This path is only reachable when scalarRowCarrier above was not set,
+    // i.e. axis 1 (if any) was resolved via a real tt.expand_dims, so there
+    // is no risk of this landing on an axis-1-scaled intermediate the way an
+    // unconditional search from here would in the scalarRowCarrier case.
     candidate.rowOffset = rank0->getResult(0);
+  }
 
   return candidate;
 }
