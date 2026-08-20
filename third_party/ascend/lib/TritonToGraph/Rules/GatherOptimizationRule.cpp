@@ -587,9 +587,22 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp) {
       return std::nullopt;
   }
 
+  // Find the first (nearest) scalar (rank-0) value feeding srcAnalysisStart:
+  // in a tiled kernel this is normally "program_id * tile_size", the tile's
+  // row start, which is exactly what row 0 of the grid built below needs to
+  // be offset by.
+  //
+  // This deliberately does NOT exclude arith::MulIOp results, unlike the
+  // pattern this rule replaced. That exclusion looked past a scalar like
+  // "program_id * tile_size" to the raw, un-scaled program_id underneath it
+  // whenever nothing else (e.g. a loop induction variable added on top, as
+  // in graph-optimize-gather.mlir's looped kernel) intervened first --
+  // silently using the wrong row offset for any single-shot (non-looped)
+  // tile whose row start is a bare multiplication, which is the common case.
+  // A rank-0 MulI result is exactly as valid a row offset as any other
+  // rank-0 value; nothing here needs it to be one specific op kind.
   std::function<bool(Operation *)> isRank0 = [&](Operation *op) -> bool {
-    return classifier.classify(op->getResult(0)).getRank() == 0 &&
-           !isa<arith::MulIOp>(op);
+    return classifier.classify(op->getResult(0)).getRank() == 0;
   };
   if (Operation *rank0 =
           findPrecedingOpWithCondition(srcAnalysisStart, isRank0, stopIndices))
