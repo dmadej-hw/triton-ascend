@@ -464,11 +464,16 @@ struct ScalarAxisMatch {
 
 std::optional<ScalarAxisMatch> findScalarAxisDimension(Operation *searchRoot,
                                                         Operation *indicesOp) {
+  // Scalar MulI only: searchRoot is often gatherAxis's own tensor-typed
+  // MulI (a different match, from findAxisDimension), which would otherwise
+  // shadow the real scalar row counter this fallback looks for.
   std::function<bool(Operation *)> isMulIWithConstant =
       [](Operation *op) -> bool {
     auto mulI = dyn_cast<arith::MulIOp>(op);
-    return mulI && (mulI.getLhs().getDefiningOp<arith::ConstantOp>() ||
-                    mulI.getRhs().getDefiningOp<arith::ConstantOp>());
+    if (!mulI || isa<RankedTensorType>(mulI.getType()))
+      return false;
+    return mulI.getLhs().getDefiningOp<arith::ConstantOp>() ||
+           mulI.getRhs().getDefiningOp<arith::ConstantOp>();
   };
   std::function<bool(Operation *)> leavesSourceRegion =
       [&](Operation *op) -> bool {
