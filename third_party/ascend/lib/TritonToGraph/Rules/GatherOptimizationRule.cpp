@@ -808,6 +808,7 @@ private:
     auto indicesTensorType = cast<TensorType>(candidate.indices.getType());
     auto indicesShape = indicesTensorType.getShape();
     auto indexType = indicesTensorType.getElementType();
+    auto loadElementType = loadTensorType.getElementType();
     ArrayRef<int64_t> srcShape = candidate.srcShape;
     int gatherAxis = candidate.gatherAxis;
     Value rowOffset = candidate.rowOffset;
@@ -840,18 +841,8 @@ private:
                                            cond, /*hasElse=*/true);
     {
       OpBuilder thenBuilder = ifOp.getThenBodyBuilder(rewriter.getListener());
-      // Sized to gatherShape (indicesShape on non-gather axes), not srcShape:
-      // building the grid at srcShape and slicing down afterwards used to
-      // load a padding tile too, which a downstream lowering fusion (load +
-      // extract_slice -> one reinterpret_cast) mis-derives strides for
-      // whenever a non-gather axis is narrower in indices than in src --
-      // recomputing them from gatherShape's sizes as if densely packed
-      // instead of preserving srcShape's real layout. Building at gatherShape
-      // directly means there's nothing to slice, so that fusion never fires.
-      SmallVector<int64_t> gatherShape(srcShape.size());
-      for (size_t i = 0; i < srcShape.size(); i++)
-        gatherShape[i] =
-            (static_cast<int>(i) == gatherAxis) ? srcShape[i] : indicesShape[i];
+      SmallVector<int64_t> gatherStrides(srcShape.size()),
+          gatherOffsets(srcShape.size()), gatherShape(srcShape.size());
       Value grid = nullptr;
       {
         SmallVector<int64_t> srcStrides(srcShape.size());
@@ -861,8 +852,12 @@ private:
           s *= srcShape[i];
         }
         auto i32Type = thenBuilder.getI32Type();
-        auto gridTy = RankedTensorType::get(gatherShape, i32Type);
+        auto gridTy = RankedTensorType::get(srcShape, i32Type);
         for (size_t i = 0; i < srcShape.size(); i++) {
+          gatherOffsets[i] = 0;
+          gatherStrides[i] = 1;
+          gatherShape[i] =
+              (static_cast<int>(i) == gatherAxis) ? srcShape[i] : indicesShape[i];
           auto rangeTy = RankedTensorType::get({gatherShape[i]}, i32Type);
           Value range = thenBuilder.create<triton::MakeRangeOp>(
               loc, rangeTy, 0, gatherShape[i]);
@@ -919,7 +914,7 @@ private:
           thenBuilder.create<arith::AddIOp>(loc, ourIndices, mask);
 
       auto newSplat = thenBuilder.create<triton::SplatOp>(
-          loc, RankedTensorType::get(gatherShape, srcPtr.getType()), srcPtr);
+          loc, RankedTensorType::get(srcShape, srcPtr.getType()), srcPtr);
       auto addPtr = thenBuilder.create<triton::AddPtrOp>(
           loc, newSplat.getType(), newSplat.getResult(), grid);
       auto load = thenBuilder.create<triton::LoadOp>(
@@ -928,6 +923,13 @@ private:
       load->setAttr(kGatherOptimisedLoadAttr,
                     StringAttr::get(load->getContext(), "source"));
       Value input = load.getResult();
+
+      if (gatherShape != ArrayRef<int64_t>(srcShape)) {
+        auto resultTy = RankedTensorType::get(gatherShape, loadElementType);
+        input = thenBuilder.create<tensor::ExtractSliceOp>(
+            loc, resultTy, load, ValueRange{}, ValueRange{}, ValueRange{},
+            gatherOffsets, gatherShape, gatherStrides);
+      }
 
       auto gather = thenBuilder.create<triton::GatherOp>(
           loc, loadTensorType, input, indexNormalized,
