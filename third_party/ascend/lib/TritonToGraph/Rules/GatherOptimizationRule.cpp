@@ -626,14 +626,22 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp) {
     }
   }
   if (candidate.gatherAxis == 0) {
-    // No scalarlike axis: if the gather axis's own size happens to be 1 in
-    // both src and indices, it's tagged scalar like any other degenerate
-    // axis, indistinguishable by tag alone. Since this rule only ever
-    // accepts the last axis anyway, checking it specifically here is safe.
-    int lastAxis = candidate.indexRank - 1;
-    if (lastAxis < baseInfo.getRank() &&
-        baseStructured[lastAxis] == AxisInfo::scalar)
-      candidate.gatherAxis = lastAxis;
+    // No scalarlike axis: a gather axis whose own size happens to be 1 in
+    // both src and indices is tagged scalar like any other degenerate axis,
+    // indistinguishable by tag alone. If exactly one axis is tagged scalar,
+    // treat it as the gather axis candidate -- the indexRank - 1 check below
+    // still rejects it unless it's actually the last axis.
+    int scalarAxis = 0;
+    for (int i = 1; i < baseInfo.getRank(); i++) {
+      if (baseStructured[i] != AxisInfo::scalar)
+        continue;
+      if (scalarAxis != 0) {
+        scalarAxis = 0;
+        break;
+      }
+      scalarAxis = i;
+    }
+    candidate.gatherAxis = scalarAxis;
   }
   if (candidate.gatherAxis == 0)
     return std::nullopt;
