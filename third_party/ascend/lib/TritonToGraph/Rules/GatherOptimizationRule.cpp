@@ -425,9 +425,24 @@ std::optional<int64_t> findAxisDimension(Operation *searchRoot,
   // muli (e.g. the outermost/last axis processed).
   Operation *mulI = findOperandDefinitionWithCondition(
       searchRoot->getResult(0), isMulIOfThisAxis, leavesSourceRegion);
-  if (!mulI)
-    return std::nullopt;
-  return extractMulIConstant(cast<arith::MulIOp>(mulI));
+  if (mulI)
+    return extractMulIConstant(cast<arith::MulIOp>(mulI));
+
+  // No muli found, but if axis's own tt.expand_dims is there anyway (just
+  // wrapped directly by the next axis's, with nothing in between), its
+  // multiplier must have canonicalized away as arith.muli(x, 1) -- the only
+  // way a multiplication can vanish from the IR outright rather than merely
+  // fail to match. That makes this axis's dimension 1.
+  std::function<bool(Operation *)> isThisAxisExpandDims =
+      [axis](Operation *op) -> bool {
+    auto expandDims = dyn_cast<triton::ExpandDimsOp>(op);
+    return expandDims && static_cast<int64_t>(expandDims.getAxis()) == axis;
+  };
+  if (findOperandDefinitionWithCondition(searchRoot->getResult(0),
+                                         isThisAxisExpandDims,
+                                         leavesSourceRegion))
+    return 1;
+  return std::nullopt;
 }
 
 // Fallback for findAxisDimension when there is no tt.expand_dims to anchor
