@@ -425,18 +425,33 @@ std::optional<int64_t> findAxisDimension(Operation *searchRoot,
   // muli (e.g. the outermost/last axis processed).
   Operation *mulI = findOperandDefinitionWithCondition(
       searchRoot->getResult(0), isMulIOfThisAxis, leavesSourceRegion);
-  if (mulI)
-    return extractMulIConstant(cast<arith::MulIOp>(mulI));
+  if (!mulI)
+    return std::nullopt;
+  return extractMulIConstant(cast<arith::MulIOp>(mulI));
+}
 
-  // No muli found, but if axis's own tt.expand_dims is there anyway (just
-  // wrapped directly by the next axis's, with nothing in between), its
-  // multiplier must have canonicalized away as arith.muli(x, 1) -- the only
-  // way a multiplication can vanish from the IR outright rather than merely
-  // fail to match. That makes this axis's dimension 1.
+// Last-resort fallback once findAxisDimension and (for axis 1)
+// findScalarAxisDimension have both failed: axis's own tt.expand_dims can
+// exist without any muli consumer for two different reasons, and only one
+// of them means dimension 1. It can be a bare placeholder immediately
+// wrapped by the next axis's expand_dims with nothing in between, meaning
+// its multiplier canonicalized away as arith.muli(x, 1) -- the only way a
+// multiplication vanishes from the IR outright rather than merely fail to
+// match. Or it can be reused to build this axis's own position range for
+// later addition (not scaling), unrelated to its size -- exactly the
+// shape findScalarAxisDimension exists to recover instead. Trying this
+// only after that one has had its chance keeps the two from colliding.
+std::optional<int64_t> findFoldedUnitAxisDimension(Operation *searchRoot,
+                                                    Operation *indicesOp,
+                                                    int64_t axis) {
   std::function<bool(Operation *)> isThisAxisExpandDims =
       [axis](Operation *op) -> bool {
     auto expandDims = dyn_cast<triton::ExpandDimsOp>(op);
     return expandDims && static_cast<int64_t>(expandDims.getAxis()) == axis;
+  };
+  std::function<bool(Operation *)> leavesSourceRegion =
+      [&](Operation *op) -> bool {
+    return op == indicesOp || isSplatOfBlockArgPointer(op);
   };
   if (findOperandDefinitionWithCondition(searchRoot->getResult(0),
                                          isThisAxisExpandDims,
@@ -665,8 +680,6 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp) {
   candidate.srcShape.push_back(indexShape[0]);
   std::optional<Value> scalarRowCarrier;
   for (int axis = 1; axis < candidate.indexRank; axis++) {
-    // A src axis genuinely sized 1 has no MulI-by-1 to find, so both
-    // searches fail on their own and the match is rejected below.
     std::optional<int64_t> dim =
         findAxisDimension(srcAnalysisStart, indicesOp, axis);
     if (!dim && axis == 1) {
@@ -676,6 +689,8 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp) {
         scalarRowCarrier = scalarMatch->carrier;
       }
     }
+    if (!dim)
+      dim = findFoldedUnitAxisDimension(srcAnalysisStart, indicesOp, axis);
     if (!dim) {
       LLVM_DEBUG(llvm::dbgs() << "[GatherOptimization] could not recover "
                                  "source dimension for axis "
