@@ -475,9 +475,13 @@ std::optional<ScalarAxisMatch> findScalarAxisDimension(Operation *searchRoot,
     return mulI.getLhs().getDefiningOp<arith::ConstantOp>() ||
            mulI.getRhs().getDefiningOp<arith::ConstantOp>();
   };
+  // Also stop at anything computed outside searchRoot's own block (e.g. a
+  // program-id-scaled loop-tile bound hoisted above the scf.for): it's a
+  // real ancestor, but not this axis's per-iteration row counter.
   std::function<bool(Operation *)> leavesSourceRegion =
       [&](Operation *op) -> bool {
-    return op == indicesOp || isSplatOfBlockArgPointer(op);
+    return op == indicesOp || isSplatOfBlockArgPointer(op) ||
+           op->getBlock() != searchRoot->getBlock();
   };
   Operation *mulIOp = findOperandDefinitionWithCondition(
       searchRoot->getResult(0), isMulIWithConstant, leavesSourceRegion);
