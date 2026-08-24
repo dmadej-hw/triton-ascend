@@ -628,15 +628,8 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp) {
   candidate.srcShape.push_back(indexShape[0]);
   std::optional<Value> scalarRowCarrier;
   for (int axis = 1; axis < candidate.indexRank; axis++) {
-    // No baseStructured[axis] == scalar shortcut here: that only means this
-    // axis's *offset* never varies (e.g. indices is degenerate there too),
-    // not that src's real dimension is 1 -- see findAxisDimension/
-    // findScalarAxisDimension below, which read src's actual size from its
-    // own tt.expand_dims+MulI regardless of whether indices vary there.
-    // When src's axis genuinely is 1-sized, that MulI-by-1 is never emitted
-    // in the first place, so both searches correctly fail below too -- if
-    // they do, we reject the match rather than guess, and the original
-    // scalar load is left in place.
+    // A src axis genuinely sized 1 has no MulI-by-1 to find, so both
+    // searches fail on their own and the match is rejected below.
     std::optional<int64_t> dim =
         findAxisDimension(srcAnalysisStart, indicesOp, axis);
     if (!dim && axis == 1) {
