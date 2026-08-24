@@ -628,12 +628,15 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp) {
   candidate.srcShape.push_back(indexShape[0]);
   std::optional<Value> scalarRowCarrier;
   for (int axis = 1; axis < candidate.indexRank; axis++) {
-    // findAxisDimension first: baseStructured[axis] == scalar means this
-    // axis's *offset* never varies (e.g. indices is degenerate there too, so
-    // src is only ever read at position 0) -- that's not the same claim as
-    // "src's real dimension is 1" here, and taking it as a shortcut skips
-    // the one search that would find src's true size from its own
-    // tt.expand_dims/MulI, even though that's still present in the IR.
+    // No baseStructured[axis] == scalar shortcut here: that only means this
+    // axis's *offset* never varies (e.g. indices is degenerate there too),
+    // not that src's real dimension is 1 -- see findAxisDimension/
+    // findScalarAxisDimension below, which read src's actual size from its
+    // own tt.expand_dims+MulI regardless of whether indices vary there.
+    // When src's axis genuinely is 1-sized, that MulI-by-1 is never emitted
+    // in the first place, so both searches correctly fail below too -- if
+    // they do, we reject the match rather than guess, and the original
+    // scalar load is left in place.
     std::optional<int64_t> dim =
         findAxisDimension(srcAnalysisStart, indicesOp, axis);
     if (!dim && axis == 1) {
@@ -642,12 +645,6 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp) {
         dim = scalarMatch->dimension;
         scalarRowCarrier = scalarMatch->carrier;
       }
-    }
-    if (!dim && axis < baseInfo.getRank() &&
-        baseStructured[axis] == AxisInfo::scalar) {
-      // Only trust this once the real searches above have failed: a
-      // genuinely 1-sized src axis has no expand_dims/MulI to find at all.
-      dim = 1;
     }
     if (!dim) {
       LLVM_DEBUG(llvm::dbgs() << "[GatherOptimization] could not recover "
