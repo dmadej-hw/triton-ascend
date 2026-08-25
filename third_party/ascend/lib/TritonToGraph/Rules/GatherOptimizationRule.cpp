@@ -374,16 +374,27 @@ struct ScalarAxisMatch {
   Value carrier; // Also this rule's rowOffset (see call site).
 };
 
-std::optional<ScalarAxisMatch> findScalarAxisDimension(Operation *searchRoot,
-                                                        Operation *indicesOp) {
+std::optional<ScalarAxisMatch>
+findScalarAxisDimension(Operation *searchRoot, Operation *indicesOp,
+                        ReadOnlyOffsetClassifier &classifier) {
   // Scalar only, so gatherAxis's own tensor-typed MulI can't shadow this.
+  // The non-constant operand must not be scalarLike either: a tile-bound
+  // computation like "program_id * row_blk" is scalarLike (pure program_id
+  // and constants), while the real per-row counter always incorporates
+  // something that genuinely varies per row, which is never scalarLike.
   std::function<bool(Operation *)> isMulIWithConstant =
-      [](Operation *op) -> bool {
+      [&](Operation *op) -> bool {
     auto mulI = dyn_cast<arith::MulIOp>(op);
     if (!mulI || isa<RankedTensorType>(mulI.getType()))
       return false;
-    return mulI.getLhs().getDefiningOp<arith::ConstantOp>() ||
-           mulI.getRhs().getDefiningOp<arith::ConstantOp>();
+    bool rhsIsConst = static_cast<bool>(
+        mulI.getRhs().getDefiningOp<arith::ConstantOp>());
+    bool lhsIsConst = static_cast<bool>(
+        mulI.getLhs().getDefiningOp<arith::ConstantOp>());
+    if (!rhsIsConst && !lhsIsConst)
+      return false;
+    Value carrier = rhsIsConst ? mulI.getLhs() : mulI.getRhs();
+    return !classifier.classify(carrier).isScalarLike();
   };
   // Also stop outside searchRoot's own block (e.g. a hoisted loop-tile bound).
   std::function<bool(Operation *)> leavesSourceRegion =
@@ -533,7 +544,7 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp) {
         findAxisDimension(srcAnalysisStart, indicesOp, axis);
     if (!dim && axis == 1) {
       if (std::optional<ScalarAxisMatch> scalarMatch =
-              findScalarAxisDimension(srcAnalysisStart, indicesOp)) {
+              findScalarAxisDimension(srcAnalysisStart, indicesOp, classifier)) {
         dim = scalarMatch->dimension;
         scalarRowCarrier = scalarMatch->carrier;
       }
