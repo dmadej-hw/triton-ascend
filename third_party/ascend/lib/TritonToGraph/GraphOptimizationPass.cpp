@@ -28,12 +28,18 @@
 #include "mlir/IR/PatternMatch.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/Twine.h"
+#include "llvm/Support/Debug.h"
 
 #include <algorithm>
 #include <array>
 #include <limits>
 #include <memory>
+#include <string>
 #include <utility>
+
+#define DEBUG_TYPE "graph-optimize"
 
 namespace mlir {
 namespace triton {
@@ -90,6 +96,36 @@ unsigned getProgramOrder(const RewritePlan &plan,
 
 bool isRuleEnabled(uint16_t ruleMask, GraphOptimizationRuleId ruleId) {
   return (ruleMask & getGraphOptimizationRuleMask(ruleId)) != 0;
+}
+
+// Human-readable rule name for -debug-only=graph-optimize output. Kept in
+// sync by hand with GraphOptimizationRuleId; an unrecognized id (there should
+// never be one) prints its raw bit value instead of asserting, since this
+// only feeds debug logging.
+std::string ruleIdToString(GraphOptimizationRuleId ruleId) {
+  switch (ruleId) {
+  case GraphOptimizationRuleId::LoadStoreTranspose:
+    return "LoadStoreTranspose";
+  case GraphOptimizationRuleId::TransposePointwiseReorder:
+    return "TransposePointwiseReorder";
+  case GraphOptimizationRuleId::StoreCoalescing:
+    return "StoreCoalescing";
+  case GraphOptimizationRuleId::RowCoalescing:
+    return "RowCoalescing";
+  case GraphOptimizationRuleId::DiagonalMaskRemoval:
+    return "DiagonalMaskRemoval";
+  case GraphOptimizationRuleId::ConvertModuloToMask:
+    return "ConvertModuloToMask";
+  case GraphOptimizationRuleId::GatherOptimization:
+    return "GatherOptimization";
+  case GraphOptimizationRuleId::StridedAxisCoalescing:
+    return "StridedAxisCoalescing";
+  case GraphOptimizationRuleId::ChunkCoalescing:
+    return "ChunkCoalescing";
+  case GraphOptimizationRuleId::StridedLoadStoreRewrite:
+    return "StridedLoadStoreRewrite";
+  }
+  return ("rule#" + llvm::Twine(static_cast<unsigned>(ruleId))).str();
 }
 
 class GraphOptimizePass final
@@ -167,14 +203,32 @@ void GraphOptimizePass::runOnOperation() {
       enabledRules.push_back(rule.get());
   }
 
+  LLVM_DEBUG({
+    llvm::dbgs() << "[graph-optimize] rule-mask="
+                << static_cast<unsigned>(options.enabledRuleMask)
+                << " max-rewrites-per-function="
+                << options.maxRewritesPerFunction << " force-simt-only="
+                << (options.forceSimtOnly ? "true" : "false")
+                << " enabled rules:";
+    for (GraphOptimizationRule *rule : enabledRules)
+      llvm::dbgs() << " " << ruleIdToString(rule->getId());
+    llvm::dbgs() << "\n";
+  });
+
   ModuleOp module = getOperation();
   for (triton::FuncOp function : module.getOps<triton::FuncOp>()) {
+    LLVM_DEBUG(llvm::dbgs() << "[graph-optimize] function @"
+                            << function.getName() << ": starting\n");
     GraphOptimizationContext context(function);
     unsigned rewriteCount = 0;
 
     for (GraphOptimizationRuleId phase : kRulePhases) {
       if (!isRuleEnabled(options.enabledRuleMask, phase))
         continue;
+
+      LLVM_DEBUG(llvm::dbgs() << "[graph-optimize] function @"
+                              << function.getName() << ": phase "
+                              << ruleIdToString(phase) << ": starting\n");
 
       while (rewriteCount < options.maxRewritesPerFunction) {
         ProgramOrderMap programOrder = buildProgramOrderMap(function);
@@ -204,8 +258,17 @@ void GraphOptimizePass::runOnOperation() {
                              return !plan || plan->getRuleId() != phase;
                            }),
             plans.end());
-        if (plans.empty())
+        LLVM_DEBUG(llvm::dbgs()
+                  << "[graph-optimize] function @" << function.getName()
+                  << ": phase " << ruleIdToString(phase) << ": found "
+                  << plans.size() << " candidate(s)\n");
+        if (plans.empty()) {
+          LLVM_DEBUG(llvm::dbgs()
+                    << "[graph-optimize] function @" << function.getName()
+                    << ": phase " << ruleIdToString(phase)
+                    << ": no candidates, moving to next phase\n");
           break;
+        }
 
         std::stable_sort(
             plans.begin(), plans.end(),
@@ -235,19 +298,43 @@ void GraphOptimizePass::runOnOperation() {
         }
 
         if (!selectedPlan) {
+          LLVM_DEBUG(llvm::dbgs()
+                    << "[graph-optimize] function @" << function.getName()
+                    << ": phase " << ruleIdToString(phase) << ": all "
+                    << plans.size()
+                    << " candidate(s) failed epoch/revalidate check, giving "
+                       "up on this phase\n");
           plans.clear();
           break;
         }
 
         const GraphOptimizationRuleId appliedRuleId = selectedPlan->getRuleId();
+        LLVM_DEBUG(llvm::dbgs()
+                  << "[graph-optimize] function @" << function.getName()
+                  << ": phase " << ruleIdToString(phase)
+                  << ": selected plan (benefit="
+                  << selectedPlan->getBenefit() << ", anchor="
+                  << (selectedPlan->getAnchor()
+                          ? selectedPlan->getAnchor()->getName().getStringRef()
+                          : llvm::StringRef("<none>"))
+                  << "): applying\n");
         IRRewriter rewriter(&getContext());
         if (failed(selectedPlan->apply(rewriter))) {
+          LLVM_DEBUG(llvm::dbgs()
+                    << "[graph-optimize] function @" << function.getName()
+                    << ": phase " << ruleIdToString(phase)
+                    << ": apply FAILED\n");
           selectedPlan.reset();
           plans.clear();
           function.emitError() << "graph-optimize failed to apply rewrite";
           signalPassFailure();
           return;
         }
+        LLVM_DEBUG(llvm::dbgs()
+                  << "[graph-optimize] function @" << function.getName()
+                  << ": phase " << ruleIdToString(phase)
+                  << ": apply PASSED (rewriteCount now " << rewriteCount + 1
+                  << ")\n");
 
         if (options.emitRemarks)
           function.emitRemark() << "applied graph optimization rule "
@@ -261,8 +348,13 @@ void GraphOptimizePass::runOnOperation() {
         ++rewriteCount;
       }
 
-      if (rewriteCount == options.maxRewritesPerFunction)
+      if (rewriteCount == options.maxRewritesPerFunction) {
+        LLVM_DEBUG(llvm::dbgs()
+                  << "[graph-optimize] function @" << function.getName()
+                  << ": max-rewrites-per-function budget exhausted, "
+                     "stopping remaining phases\n");
         break;
+      }
     }
 
     // RowCoalescing has the same function-local candidate/rewrite interface
@@ -272,8 +364,12 @@ void GraphOptimizePass::runOnOperation() {
     // TransposePointwiseReorder, and StoreCoalescing even when that budget
     // has already been exhausted.
     if (!isRuleEnabled(options.enabledRuleMask,
-                       GraphOptimizationRuleId::RowCoalescing))
+                       GraphOptimizationRuleId::RowCoalescing)) {
+      LLVM_DEBUG(llvm::dbgs() << "[graph-optimize] function @"
+                              << function.getName()
+                              << ": RowCoalescing disabled, skipping\n");
       continue;
+    }
 
     GraphOptimizationRule *rowRule = nullptr;
     for (GraphOptimizationRule *rule : enabledRules) {
@@ -284,6 +380,10 @@ void GraphOptimizePass::runOnOperation() {
     }
     if (!rowRule)
       continue;
+
+    LLVM_DEBUG(llvm::dbgs() << "[graph-optimize] function @"
+                            << function.getName()
+                            << ": RowCoalescing: starting\n");
 
     if (failed(context.ensure(rowRule->getAnalysisRequirements()))) {
       function.emitError() << "graph-optimize failed to build Row analyses";
@@ -305,6 +405,10 @@ void GraphOptimizePass::runOnOperation() {
                                     GraphOptimizationRuleId::RowCoalescing;
                        }),
         rowPlans.end());
+    LLVM_DEBUG(llvm::dbgs()
+              << "[graph-optimize] function @" << function.getName()
+              << ": RowCoalescing: found " << rowPlans.size()
+              << " candidate(s)\n");
     if (rowPlans.empty())
       continue;
 
@@ -335,17 +439,28 @@ void GraphOptimizePass::runOnOperation() {
       selectedRowPlan = std::move(plan);
       break;
     }
-    if (!selectedRowPlan)
+    if (!selectedRowPlan) {
+      LLVM_DEBUG(llvm::dbgs()
+                << "[graph-optimize] function @" << function.getName()
+                << ": RowCoalescing: all " << rowPlans.size()
+                << " candidate(s) failed epoch/revalidate check\n");
       continue;
+    }
 
     IRRewriter rewriter(&getContext());
     if (failed(selectedRowPlan->apply(rewriter))) {
+      LLVM_DEBUG(llvm::dbgs() << "[graph-optimize] function @"
+                              << function.getName()
+                              << ": RowCoalescing: apply FAILED\n");
       selectedRowPlan.reset();
       rowPlans.clear();
       function.emitError() << "graph-optimize failed to apply Row rewrite";
       signalPassFailure();
       return;
     }
+    LLVM_DEBUG(llvm::dbgs() << "[graph-optimize] function @"
+                            << function.getName()
+                            << ": RowCoalescing: apply PASSED\n");
 
     if (options.emitRemarks)
       function.emitRemark()

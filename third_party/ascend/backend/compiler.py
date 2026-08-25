@@ -76,10 +76,18 @@ from triton.backends.compiler import (
 from triton.runtime.cache import get_dump_manager
 
 # Bit for GraphOptimizationRuleId::GatherOptimization (see
-# third_party/ascend/include/TritonToGraph/GraphOptimization.h). Kept out of
-# the default graph_optimize_rule_mask (511) below, since this rule's
-# analysis is only exercised on post-triton-to-structure IR -- see its use in
-# ttir_to_linalg.
+# third_party/ascend/include/TritonToGraph/GraphOptimization.h). Split out of
+# the other 511 (1|2|...|256) rule bits because this rule's analysis is only
+# exercised/valid on post-triton-to-structure IR, so it has to run as its own
+# graph-optimize instance in ttir_to_linalg rather than alongside the rest in
+# make_ttir's -- see both functions' use of this constant below.
+#
+# opt.graph_optimize_rule_mask (single field, default 511 | 512) is still the
+# one knob a caller sets; each instance below just ANDs it down to its own
+# bit range, so e.g. graph_optimize_rule_mask=511 disables only Gather, and
+# =512 runs only Gather. make_ttir's `& ~512` also means Gather can never
+# accidentally run at that (wrong, pre-triton-to-structure) pipeline point no
+# matter what mask value is passed.
 _GATHER_OPTIMIZATION_RULE_MASK = 512
 
 
@@ -187,7 +195,7 @@ def make_ttir(mod, metadata, opt):
     if opt.enable_graph_optimize:
         ascend.passes.ttir.add_graph_optimize(
             pm,
-            rule_mask=opt.graph_optimize_rule_mask,
+            rule_mask=opt.graph_optimize_rule_mask & ~_GATHER_OPTIMIZATION_RULE_MASK,
             max_rewrites_per_function=opt.graph_optimize_max_rewrites_per_function,
             ub_capacity_bytes=opt.graph_optimize_ub_capacity_bytes,
             emit_remarks=opt.graph_optimize_emit_remarks,
@@ -271,10 +279,13 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         # second graph-optimize instance, scoped by rule_mask to just that one
         # rule, kept at this point in the pipeline (post triton-to-structure)
         # because its analysis is only exercised/validated on structured IR.
-        # The make_ttir instance above intentionally excludes this rule from
-        # its default mask (511 doesn't include bit 512).
-        ascend.passes.ttir.add_graph_optimize(
-            pm, rule_mask=_GATHER_OPTIMIZATION_RULE_MASK)
+        # Reads the same opt.graph_optimize_rule_mask the make_ttir instance
+        # above uses (which excludes this bit via `& ~512`) so a caller has
+        # one knob for both: e.g. graph_optimize_rule_mask=511 disables just
+        # Gather, =512 runs only Gather.
+        gather_rule_mask = opt.graph_optimize_rule_mask & _GATHER_OPTIMIZATION_RULE_MASK
+        if gather_rule_mask:
+            ascend.passes.ttir.add_graph_optimize(pm, rule_mask=gather_rule_mask)
         ascend.passes.ttir.add_triton_to_unstructure(pm, compile_on_910_95, force_simt_template)
         ascend.passes.ttir.add_triton_to_hivm(pm)
         ascend.passes.ttir.add_triton_to_hfusion(pm, compile_on_910_95)
@@ -1111,7 +1122,11 @@ class NPUOptions:
     backend_name: str = 'cann'
     instrumentation_mode: str = ""
     enable_graph_optimize: bool = True
-    graph_optimize_rule_mask: int = 511
+    # 511 = all rules except GatherOptimization (bit 512, see
+    # _GATHER_OPTIMIZATION_RULE_MASK); including it here keeps Gather enabled
+    # by default the same way the other 9 rules are, even though it runs as
+    # a separate graph-optimize instance in ttir_to_linalg.
+    graph_optimize_rule_mask: int = 511 | _GATHER_OPTIMIZATION_RULE_MASK
     graph_optimize_max_rewrites_per_function: int = 64
     graph_optimize_ub_capacity_bytes: Optional[int] = None
     graph_optimize_emit_remarks: bool = False

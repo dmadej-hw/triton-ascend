@@ -29,7 +29,7 @@ import triton
 import triton.language as tl
 from triton._C.libtriton import ascend, ir
 from triton._C.libtriton.ascend import ir as ascend_ir
-from triton.backends.ascend.compiler import NPUOptions, make_ttir
+from triton.backends.ascend.compiler import NPUOptions, make_ttir, _GATHER_OPTIMIZATION_RULE_MASK
 from triton.compiler.code_generator import ast_to_ttir
 from triton.compiler.compiler import ASTSource
 from triton.errors import TritonError
@@ -311,7 +311,7 @@ def test_default_generic_graph_mask_excludes_legacy_memory_compatibility(tmp_pat
         enable_graph_optimize=True,
         graph_optimize_rule_mask=7,
     )
-    assert default_options.graph_optimize_rule_mask == 511
+    assert default_options.graph_optimize_rule_mask == 511 | _GATHER_OPTIMIZATION_RULE_MASK
 
     default_result = make_ttir(
         make_legacy_memory_isolation_ast_ttir(default_options),
@@ -370,7 +370,7 @@ def test_default_graph_mask_preserves_native_graph_rule_bundle(monkeypatch, tmp_
     native_only_ttir = str(make_fused_swiglu_ttir(native_only_options))
     default_ttir = str(make_fused_swiglu_ttir(default_options))
 
-    assert default_options.graph_optimize_rule_mask == 511
+    assert default_options.graph_optimize_rule_mask == 511 | _GATHER_OPTIMIZATION_RULE_MASK
     assert default_ttir == native_only_ttir
     # A rule-mask=0 control would retain the original [N, M] pointer layout;
     # the default must still perform the native transpose rewrite to [M, N].
