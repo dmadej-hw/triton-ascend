@@ -109,10 +109,8 @@ private:
     return info;
   }
 
-  // Mirrors OffsetAnalysis::parseBinaryOp, shared by every op it instantiates
-  // with (arith::RemSIOp, DivSIOp, the float arithmetic ops, MaxSIOp, MinSIOp,
-  // CmpIOp, AndIOp, OrIOp): structured+scalarlike survives only if both
-  // operands are scalarLike: otherwise the whole axis range is unstructured.
+  // Mirrors OffsetAnalysis::parseBinaryOp: survives as scalarlike only if
+  // both operands are scalarLike, else the whole axis range is unstructured.
   static PtrOffsetInfo combineBinaryLike(const PtrOffsetInfo &lhs,
                                          const PtrOffsetInfo &rhs) {
     PtrOffsetInfo info;
@@ -263,9 +261,7 @@ private:
         return info;
       }
 
-      // Everything else (arith::SelectOp, FPToSI/SIToFP, triton::ClampFOp,
-      // triton::AdvanceOp, ...): mirrors OffsetAnalysis's own dispatch
-      // fallback for anything its cascade does not name explicitly.
+      // Everything else: mirrors OffsetAnalysis's own dispatch fallback.
       return unstructuredLike(value);
     }
 
@@ -325,8 +321,7 @@ bool isIntegerTensorType(Type type, int &rankOut) {
   return true;
 }
 
-// Extracts the single splat integer constant multiplied in `mulI`, i.e. the
-// literal dimension size a stride-computation MulI encodes.
+// Extracts the single splat integer constant multiplied in `mulI`.
 std::optional<int64_t> extractMulIConstant(arith::MulIOp mulI) {
   arith::ConstantOp constOp = mulI.getRhs().getDefiningOp<arith::ConstantOp>();
   if (!constOp)
