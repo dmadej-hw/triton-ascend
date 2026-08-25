@@ -75,6 +75,13 @@ from triton.backends.compiler import (
 )
 from triton.runtime.cache import get_dump_manager
 
+# Bit for GraphOptimizationRuleId::GatherOptimization (see
+# third_party/ascend/include/TritonToGraph/GraphOptimization.h). Kept out of
+# the default graph_optimize_rule_mask (511) below, since this rule's
+# analysis is only exercised on post-triton-to-structure IR -- see its use in
+# ttir_to_linalg.
+_GATHER_OPTIMIZATION_RULE_MASK = 512
+
 
 # TODO: materialize the concrete min shape
 def min_dot_size(target: GPUTarget):
@@ -259,6 +266,15 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         ascend.passes.ttir.add_triton_to_structure(pm, enable_mask_fallback_conversion, optimize_dynamic_offset)
         ascend.passes.ttir.add_discrete_mask_access_conversion(pm, compile_on_910_95, force_simt_template)
         ascend.passes.ttir.add_triton_to_annotation(pm)
+        # GatherOptimization is a GraphOptimizationRule (see
+        # TritonToGraph/GraphOptimization.h), not a standalone pass: this is a
+        # second graph-optimize instance, scoped by rule_mask to just that one
+        # rule, kept at this point in the pipeline (post triton-to-structure)
+        # because its analysis is only exercised/validated on structured IR.
+        # The make_ttir instance above intentionally excludes this rule from
+        # its default mask (511 doesn't include bit 512).
+        ascend.passes.ttir.add_graph_optimize(
+            pm, rule_mask=_GATHER_OPTIMIZATION_RULE_MASK)
         ascend.passes.ttir.add_triton_to_unstructure(pm, compile_on_910_95, force_simt_template)
         ascend.passes.ttir.add_triton_to_hivm(pm)
         ascend.passes.ttir.add_triton_to_hfusion(pm, compile_on_910_95)

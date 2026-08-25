@@ -49,7 +49,7 @@ namespace triton {
 namespace cfg {
 namespace {
 
-constexpr std::array<GraphOptimizationRuleId, 5> kRulePhases = {
+constexpr std::array<GraphOptimizationRuleId, 6> kRulePhases = {
     // DiagonalMaskRemoval runs first because it deletes a quadratic
     // intermediate tensor, so the later phases match and budget UB against the
     // already shrunken IR.
@@ -60,6 +60,10 @@ constexpr std::array<GraphOptimizationRuleId, 5> kRulePhases = {
     GraphOptimizationRuleId::LoadStoreTranspose,
     GraphOptimizationRuleId::TransposePointwiseReorder,
     GraphOptimizationRuleId::StoreCoalescing,
+    // GatherOptimization replaces a whole tt.load with an scf.if guarding a
+    // tt.gather; it does not interact with the memory-access rules above, so
+    // it is scheduled last and does not need to run before them.
+    GraphOptimizationRuleId::GatherOptimization,
 };
 
 using ProgramOrderMap = llvm::DenseMap<Operation *, unsigned>;
@@ -378,6 +382,10 @@ void populateBuiltinGraphOptimizationRules(
   if (isRuleEnabled(options.enabledRuleMask,
                     GraphOptimizationRuleId::StoreCoalescing)) {
     rules.push_back(createStoreCoalescingRule(options.ubCapacityBytes));
+  }
+  if (isRuleEnabled(options.enabledRuleMask,
+                    GraphOptimizationRuleId::GatherOptimization)) {
+    rules.push_back(createGatherOptimizationRule());
   }
   if (options.forceSimtOnly &&
       isRuleEnabled(options.enabledRuleMask,
