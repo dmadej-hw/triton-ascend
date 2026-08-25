@@ -58,46 +58,24 @@ using AxisInfo = PtrOffsetInfo::AxisInfo;
 //===----------------------------------------------------------------------===//
 // Read-only mirror of TritonToUnstructure::OffsetAnalysis's classification.
 //
-// GraphOptimizationRule::findCandidates and RewritePlan::revalidate() have no
-// IRRewriter (see GraphOptimizationRule.h) -- by design, neither is allowed to
-// mutate IR. The real OffsetAnalysis::parse() cannot be used from either: its
-// triton::AddPtrOp handler (parseAddPtr) unconditionally inserts a sign-extend
-// and an add to materialize a companion offset value, regardless of whether
-// anything in the visited subtree is pointer-tracked.
+// findCandidates/revalidate() have no IRRewriter and must not mutate IR, so
+// the real (mutating) OffsetAnalysis::parse() can't be used here. This walker
+// reimplements only the classification rules, never the companion-offset
+// construction parse() also does. triton::LoadOp is the one opacity boundary
+// (matches parseLoad tagging a load result fully unstructured); AddPtrOp is
+// deliberately not one, since analyzeGatherCandidate's searches walk into
+// nested addptrs on the pointer chain and would misclassify them otherwise.
 //
-// This walker reimplements only the classification rules that actually shape
-// the AxisInfo tags GatherOptimization reads (isUnstructured/isStructured/
-// isScalarLike/getStructured/getRank); it never reads PtrOffsetInfo::getOffset
-// so it never needs the materialized companion value OffsetAnalysis::parse
-// builds -- every node kind mirrors its OffsetAnalysis counterpart exactly,
-// minus that construction. The one true opacity boundary is triton::LoadOp:
-// the real parseLoad always tags a tensor result fully unstructured
-// regardless of what its own pointer chain classifies to (only isScalarLike
-// would differ, and GatherOptimization never reads isScalarLike on a load
-// result), so stopping there means the indices tensor's own address
-// computation never needs to be traced. triton::AddPtrOp is deliberately NOT
-// an opacity boundary, even though the outer/anchor addptr's pointer operand
-// is never classified from analyzeGatherCandidate's own entry point (see
-// there): the searches in analyzeGatherCandidate walk both operands of every
-// addptr they cross, including ones nested inside the pointer chain (a base
-// pointer computed by one addptr, then broadcast and combined with
-// per-element offsets by an outer one -- see the non-last-axis example in
-// graph-optimize-gather.mlir), so treating every addptr as opaque would
-// misclassify a nested one, and anything reading its result, as fully
-// unstructured and risk misidentifying it as the indices tensor.
-//
-// This walker never calls PtrOffsetInfo::setPtr, so .getPtr() reads null on
-// every PtrOffsetInfo it produces -- harmless, since nothing here reads it
-// either; the base pointer is found independently via
-// isSplatOfBlockArgPointer instead (see analyzeGatherCandidate).
+// .getPtr() is always null on the PtrOffsetInfo this produces (setPtr is
+// never called) -- nothing here reads it; the base pointer is found via
+// isSplatOfBlockArgPointer instead.
 class ReadOnlyOffsetClassifier {
 public:
   const PtrOffsetInfo &classify(Value value) {
     auto it = cache.find(value);
     if (it != cache.end())
       return it->second;
-    // Seed a placeholder before recursing: OffsetAnalysis's own parse() relies
-    // on memoization the same way to keep a DAG walk linear, and it also
+    // Seed a placeholder before recursing: keeps the walk linear on a DAG and
     // guards against a loop-carried value depending on itself.
     PtrOffsetInfo &slot = cache[value];
     slot = classifyUncached(value);
@@ -262,12 +240,9 @@ private:
                                 dstType);
       }
       if (auto splat = dyn_cast<triton::SplatOp>(defOp)) {
-        // The real parseSplat tags dstStructured (dim==1 -> scalar, else
-        // scalarlike) and sets scalarLike=true identically whether or not
-        // the element type is a pointer; only a pointer destination also
-        // materializes a companion i64 offset splat, which this walker never
-        // needs (see class comment). So the same tagging applies here
-        // regardless of element type.
+        // Same tagging regardless of element type: only a pointer
+        // destination also materializes a companion offset, which this
+        // walker never needs.
         if (auto dstType = dyn_cast<RankedTensorType>(splat.getResult().getType()))
           return splatTagging(dstType);
         return unstructuredLike(value);
@@ -323,10 +298,8 @@ private:
 // build or erase an operation.
 //===----------------------------------------------------------------------===//
 
-// Marks a tt.load as already handled by this rule: either the generated
-// "source"/"fallback" load inside a scf.if it already built, or a load it
-// already proved does not match. findCandidates and matchAndRewrite-style
-// re-entrancy both rely on this to avoid reconsidering those loads.
+// Marks a tt.load already generated by this rule (the "source"/"fallback"
+// load inside a scf.if it built), so findCandidates never reconsiders it.
 constexpr llvm::StringLiteral kGatherOptimisedLoadAttr = "gather.optimised.load";
 
 struct GatherCandidate {
@@ -374,32 +347,15 @@ std::optional<int64_t> extractMulIConstant(arith::MulIOp mulI) {
   return std::nullopt;
 }
 
-// Finds the literal dimension size that axis `axis` contributes to the
-// source tensor's shape: the constant operand of the single arith.muli that
-// directly multiplies axis's own tt.expand_dims (its `axis` attribute names
-// the physical dimension authoritatively -- no positional bookkeeping is
-// needed to attribute it).
+// Finds the literal dimension size axis `axis` contributes to the source
+// tensor's shape: the constant operand of the arith.muli that directly
+// multiplies axis's own tt.expand_dims.
 //
-// This replaces a previous implementation that walked the whole offset
-// expression once, front to back, guessing from op *order* how many
-// tt.expand_dims a run of arith.muli should cancel out. Anchoring the search
-// on each axis's own tt.expand_dims instead means every axis is resolved
-// independently, with no cross-axis counter to get out of sync.
-//
-// The tt.expand_dims for one axis is frequently a shared SSA value with more
-// than one arith.muli directly using it -- e.g. the same "logical position"
-// tensor gets multiplied by the source tensor's own stride for the pointer
-// side of a gather, and separately by a different constant on the branch
-// that addresses the indices themselves. Searching *forward* through
-// getUsers() for "a" consuming muli would be ambiguous between those. This
-// searches *backward* instead, from searchRoot (itself always anchored on
-// the pointer side, never inside the indices branch -- see
-// analyzeGatherCandidate), for a muli that directly multiplies axis's
-// tt.expand_dims. Since the indices-side muli is only reachable *forward*
-// from that tt.expand_dims (through its other use), not backward from
-// searchRoot, this can never pick the wrong one: the two consumers are
-// disambiguated by which one searchRoot's own operand chain leads to, not by
-// any property of the tt.expand_dims or muli themselves.
+// One tt.expand_dims is often shared by more than one arith.muli (e.g. the
+// pointer side and the indices side each multiply it by a different
+// constant), so this searches *backward* from searchRoot -- always anchored
+// on the pointer side -- rather than forward through getUsers(), which would
+// be ambiguous between the two consumers.
 std::optional<int64_t> findAxisDimension(Operation *searchRoot,
                                          Operation *indicesOp, int64_t axis) {
   auto isAxisExpandDims = [axis](Value v) -> bool {
@@ -412,17 +368,15 @@ std::optional<int64_t> findAxisDimension(Operation *searchRoot,
     return mulI && (isAxisExpandDims(mulI.getLhs()) ||
                     isAxisExpandDims(mulI.getRhs()));
   };
-  // Never cross into the indices branch or the base-pointer splat: neither
-  // can hold this axis's dimension. Do not prune on "a different axis's
-  // tt.expand_dims": axes are typically built up by nesting one
-  // tt.expand_dims inside another (see e.g. graph-optimize-gather.mlir), so
-  // reaching axis 0's muli can require walking through axis 1's node first.
+  // Never cross into the indices branch or the base-pointer splat. Don't
+  // prune on "a different axis's tt.expand_dims": axes nest one inside
+  // another, so reaching axis 0's muli can require walking through axis 1's
+  // node first.
   std::function<bool(Operation *)> leavesSourceRegion =
       [&](Operation *op) -> bool {
     return op == indicesOp || isSplatOfBlockArgPointer(op);
   };
-  // Inclusive of searchRoot itself: it is frequently *is* the axis's own
-  // muli (e.g. the outermost/last axis processed).
+  // Inclusive of searchRoot itself: it frequently *is* the axis's own muli.
   Operation *mulI = findOperandDefinitionWithCondition(
       searchRoot->getResult(0), isMulIOfThisAxis, leavesSourceRegion);
   if (!mulI)
@@ -431,16 +385,12 @@ std::optional<int64_t> findAxisDimension(Operation *searchRoot,
 }
 
 // Last-resort fallback once findAxisDimension and (for axis 1)
-// findScalarAxisDimension have both failed: axis's own tt.expand_dims can
-// exist without any muli consumer for two different reasons, and only one
-// of them means dimension 1. It can be a bare placeholder immediately
-// wrapped by the next axis's expand_dims with nothing in between, meaning
-// its multiplier canonicalized away as arith.muli(x, 1) -- the only way a
-// multiplication vanishes from the IR outright rather than merely fail to
-// match. Or it can be reused to build this axis's own position range for
-// later addition (not scaling), unrelated to its size -- exactly the
-// shape findScalarAxisDimension exists to recover instead. Trying this
-// only after that one has had its chance keeps the two from colliding.
+// findScalarAxisDimension have both failed: if axis's own tt.expand_dims
+// exists but was never multiplied, the multiplier must have canonicalized
+// away as arith.muli(x, 1) -- so the dimension is 1. Tried last because that
+// expand_dims can also be reused to build the axis's own position range for
+// later addition rather than scaling, which findScalarAxisDimension exists
+// to catch instead.
 std::optional<int64_t> findFoldedUnitAxisDimension(Operation *searchRoot,
                                                     Operation *indicesOp,
                                                     int64_t axis) {
@@ -461,35 +411,19 @@ std::optional<int64_t> findFoldedUnitAxisDimension(Operation *searchRoot,
 }
 
 // Fallback for findAxisDimension when there is no tt.expand_dims to anchor
-// on at all: a kernel that processes one row per scf.for iteration (see
-// graph-optimize-gather-scalar-row.mlir) can compute axis 1's entire
-// absolute position as "(row counter) * axis1_size + local_position",
-// splatting the scaled row counter directly instead of building axis 1 up
-// with tt.expand_dims/tt.broadcast the way later axes are. In that shape
-// there is no tt.expand_dims for findAxisDimension's anchor to find, but the
-// dimension is still recoverable: it is simply the constant multiplied by
-// the row counter in that one arith.muli.
-//
-// That same arith.muli's *other* operand -- the row counter itself, still
-// unscaled by axis1_size -- is also exactly this rule's rowOffset (see the
-// call site). Returning it here, rather than making the caller re-derive it
-// with a second, independent search, matters for correctness, not just
-// convenience: a generic "first rank-0 value reachable from
-// srcAnalysisStart" search (which is what finds rowOffset when this fallback
-// is not needed -- see further down) would, in this exact shape, find this
-// arith.muli's *scaled* result first, since it sits strictly closer to
-// srcAnalysisStart than the unscaled row counter beneath it. Tying rowOffset
-// to specifically the operand this axis's own dimension came from is what
-// keeps the two consistent with each other.
-//
-// Only used for axis 1: it is the one axis structurally adjacent to axis 0,
-// which is never itself built from tt.expand_dims (its dimension always
-// comes directly from the indices' own shape -- see the call site), so it is
-// the one place a bare "row counter" can plausibly stand in for what would
-// otherwise be a tt.expand_dims-anchored axis.
+// on: a kernel processing one row per scf.for iteration (see
+// graph-optimize-gather-scalar-row.mlir) can compute axis 1's absolute
+// position as "(row counter) * axis1_size + local_position" entirely in
+// scalar form, splatting the result instead of building axis 1 up with
+// tt.expand_dims/tt.broadcast. The dimension is the constant in that one
+// arith.muli; only used for axis 1, since it's the one axis structurally
+// adjacent to axis 0 (whose own dimension comes directly from the indices'
+// shape) that a bare row counter can stand in for.
 struct ScalarAxisMatch {
   int64_t dimension;
-  Value carrier; // The row counter this axis's dimension scales.
+  Value carrier; // The row counter this axis's dimension scales -- also
+                  // this rule's rowOffset, tied together so both stay
+                  // consistent with the same arith.muli (see call site).
 };
 
 std::optional<ScalarAxisMatch> findScalarAxisDimension(Operation *searchRoot,
@@ -543,25 +477,13 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp) {
       loadTensorType.getShape() != ptrTensorType.getShape())
     return std::nullopt;
 
-  // Classify only the offset side of the outer addptr, not the pointer side,
-  // as an optimization: OffsetAnalysis::parseAddPtr classifies the addptr
-  // result as combineInfo(ptrInfo, offsetInfo), the per-axis min of both
-  // sides' tags (unstructured < structured < scalarlike < scalar), and a
-  // plain tt.splat base pointer always tags scalar/scalarlike (never the
-  // smallest), so a bare "ptr = tt.splat %arg" contributes nothing this min
-  // could act on -- offsetInfo alone already equals what combining with it
-  // would give. This still holds when the pointer side is a longer chain of
-  // splat/broadcast/expand_dims (validated against a real 5D example), but is
-  // NOT proven in general for a pointer side that itself nests another
-  // tt.addptr whose own offset could be unstructured (see
-  // graph-optimize-gather.mlir's non-last-axis example, which does have this
-  // shape) -- there, this early check could in principle accept an
-  // addPtrOp this rule's real combined classification would have rejected.
-  // The later checks (isStructuredNotScalar, isSplatOfBlockArgPointer, and
-  // per-axis shape recovery all failing to find what they need) are expected
-  // to reject any such case regardless, since they inspect the pointer side
-  // directly -- but that expectation, unlike this specific min-with-splat
-  // argument, is not proven, only exercised by the examples available so far.
+  // Classify only the offset side of the outer addptr, not the pointer side:
+  // combineInfo takes the per-axis min of both sides' tags, and a plain
+  // tt.splat base pointer never tags below what the offset side already
+  // gives, so offsetInfo alone suffices. Not proven when the pointer side
+  // nests another tt.addptr with a potentially-unstructured offset of its
+  // own -- the later checks below are expected to reject any such case
+  // regardless, by inspecting the pointer side directly.
   ReadOnlyOffsetClassifier classifier;
   Value offsetValue = addPtrOp.getOffset();
   const PtrOffsetInfo &offsetInfo = classifier.classify(offsetValue);
@@ -641,11 +563,10 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp) {
     }
   }
   if (candidate.gatherAxis == 0) {
-    // No scalarlike axis: a gather axis whose own size happens to be 1 in
-    // both src and indices is tagged scalar like any other degenerate axis,
-    // indistinguishable by tag alone. If exactly one axis is tagged scalar,
-    // treat it as the gather axis candidate -- the indexRank - 1 check below
-    // still rejects it unless it's actually the last axis.
+    // No scalarlike axis: a gather axis sized 1 in both src and indices is
+    // tagged scalar like any other degenerate axis. If exactly one axis is
+    // tagged scalar, treat it as the candidate -- indexRank - 1 below still
+    // rejects it unless it's actually the last axis.
     int scalarAxis = 0;
     for (int i = 1; i < baseInfo.getRank(); i++) {
       if (baseStructured[i] != AxisInfo::scalar)
@@ -709,10 +630,8 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp) {
   }
 
   if (scalarRowCarrier) {
-    // Axis 1's dimension came from findScalarAxisDimension: its carrier
-    // *is* rowOffset (see that function's comment for why this must be tied
-    // to the same arith.muli axis 1's dimension came from, rather than
-    // re-derived independently below).
+    // Axis 1's dimension came from findScalarAxisDimension: its carrier is
+    // rowOffset, tied to the same arith.muli rather than re-derived below.
     candidate.rowOffset = *scalarRowCarrier;
   } else if (Operation *rank0 = findPrecedingOpWithCondition(
                  srcAnalysisStart,
@@ -721,24 +640,10 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp) {
                           0;
                  },
                  stopIndices)) {
-    // Find the first (nearest) scalar (rank-0) value feeding
-    // srcAnalysisStart: in a tiled kernel this is normally
-    // "program_id * tile_size", the tile's row start, which is exactly what
-    // row 0 of the grid built below needs to be offset by.
-    //
-    // This deliberately does NOT exclude arith::MulIOp results, unlike the
-    // pattern this rule replaced. That exclusion looked past a scalar like
-    // "program_id * tile_size" to the raw, un-scaled program_id underneath
-    // it whenever nothing else (e.g. a loop induction variable added on top,
-    // as in graph-optimize-gather.mlir's looped kernel) intervened first --
-    // silently using the wrong row offset for any single-shot (non-looped)
-    // tile whose row start is a bare multiplication, which is the common
-    // case. A rank-0 MulI result is exactly as valid a row offset as any
-    // other rank-0 value; nothing here needs it to be one specific op kind.
-    // This path is only reachable when scalarRowCarrier above was not set,
-    // i.e. axis 1 (if any) was resolved via a real tt.expand_dims, so there
-    // is no risk of this landing on an axis-1-scaled intermediate the way an
-    // unconditional search from here would in the scalarRowCarrier case.
+    // Nearest scalar (rank-0) value feeding srcAnalysisStart: normally
+    // "program_id * tile_size", the tile's row start. Only reachable when
+    // scalarRowCarrier wasn't set, i.e. axis 1 (if any) came from a real
+    // tt.expand_dims, so this can't land on an axis-1-scaled intermediate.
     candidate.rowOffset = rank0->getResult(0);
   }
 
@@ -1028,14 +933,10 @@ public:
       GraphOptimizationContext &context,
       SmallVectorImpl<std::unique_ptr<RewritePlan>> &plans) override {
     context.getFunction().walk([&](triton::LoadOp loadOp) {
-      // A load this rule already generated (the "source" or "fallback" load
-      // inside a scf.if it already built) must never be reconsidered. Unlike
-      // the greedy-pattern-driver version this rule replaces, findCandidates
-      // re-walks the whole function from scratch every iteration (see
-      // GraphOptimizePass), so a load that simply doesn't match yet needs no
-      // "already rejected" marker: it is cheap to -- and safe to -- just
-      // re-analyze next time, and doing so lets it start matching again if an
-      // earlier rewrite this same pass run changed its shape.
+      // A load that doesn't match yet needs no "already rejected" marker:
+      // findCandidates re-walks the whole function every iteration, so it's
+      // safe to just re-analyze next time -- and lets it start matching if
+      // an earlier rewrite this pass run changed its shape.
       if (loadOp->getAttr(kGatherOptimisedLoadAttr))
         return;
       std::optional<GatherCandidate> candidate = analyzeGatherCandidate(loadOp);
