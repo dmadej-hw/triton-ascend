@@ -133,16 +133,22 @@ void traverseForwardUpdateUserChainIf(
 mlir::Operation *findOperandDefinitionWithCondition(
     mlir::Value operand, const std::function<bool(Operation *)> &condFn);
 
-// Same, but from rootOp's operands (exclusive of rootOp itself).
+// Traverse back from rootOp's operands (exclusive of rootOp itself) for the
+// first op matching condFn, or nullptr.
 mlir::Operation *
 findPrecedingOpWithCondition(mlir::Operation *rootOp,
                              const std::function<bool(Operation *)> &condFn);
 
-// Same two, but also stop (returning nullptr) if stopFn matches first.
+// Traverse back from operand's defining op (inclusive) for the first op
+// matching condFn, or nullptr; stop early (also returning nullptr) if
+// stopFn matches first.
 mlir::Operation *findOperandDefinitionWithCondition(
     mlir::Value operand, const std::function<bool(Operation *)> &condFn,
     const std::function<bool(Operation *)> &stopFn);
 
+// Traverse back from rootOp's operands (exclusive of rootOp itself) for the
+// first op matching condFn, or nullptr; stop early (also returning nullptr)
+// if stopFn matches first.
 mlir::Operation *
 findPrecedingOpWithCondition(mlir::Operation *rootOp,
                              const std::function<bool(Operation *)> &condFn,
