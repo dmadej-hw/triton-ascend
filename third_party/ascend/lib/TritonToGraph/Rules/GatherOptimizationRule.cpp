@@ -56,19 +56,15 @@ namespace {
 using AxisInfo = PtrOffsetInfo::AxisInfo;
 
 //===----------------------------------------------------------------------===//
-// Read-only mirror of TritonToUnstructure::OffsetAnalysis's classification.
+// Read-only mirror of OffsetAnalysis's classification: findCandidates and
+// revalidate() must not mutate IR, so the real (mutating)
+// OffsetAnalysis::parse() can't be used. Reimplements only the
+// classification rules, not parse()'s companion-offset construction.
+// triton::LoadOp is the one opacity boundary; AddPtrOp is deliberately not
+// one, since searches below walk into nested addptrs on the pointer chain.
 //
-// findCandidates/revalidate() have no IRRewriter and must not mutate IR, so
-// the real (mutating) OffsetAnalysis::parse() can't be used here. This walker
-// reimplements only the classification rules, never the companion-offset
-// construction parse() also does. triton::LoadOp is the one opacity boundary
-// (matches parseLoad tagging a load result fully unstructured); AddPtrOp is
-// deliberately not one, since analyzeGatherCandidate's searches walk into
-// nested addptrs on the pointer chain and would misclassify them otherwise.
-//
-// .getPtr() is always null on the PtrOffsetInfo this produces (setPtr is
-// never called) -- nothing here reads it; the base pointer is found via
-// isSplatOfBlockArgPointer instead.
+// .getPtr() is always null here (setPtr is never called) -- the base
+// pointer is found via isSplatOfBlockArgPointer instead.
 class ReadOnlyOffsetClassifier {
 public:
   const PtrOffsetInfo &classify(Value value) {
@@ -347,10 +343,6 @@ std::optional<int64_t> extractMulIConstant(arith::MulIOp mulI) {
   return std::nullopt;
 }
 
-// Finds the literal dimension size axis `axis` contributes to the source
-// tensor's shape: the constant operand of the arith.muli that directly
-// multiplies axis's own tt.expand_dims.
-//
 // One tt.expand_dims is often shared by more than one arith.muli (e.g. the
 // pointer side and the indices side each multiply it by a different
 // constant), so this searches *backward* from searchRoot -- always anchored
@@ -461,11 +453,9 @@ std::optional<ScalarAxisMatch> findScalarAxisDimension(Operation *searchRoot,
   return ScalarAxisMatch{*dim, carrier};
 }
 
-// Read-only counterpart of the former GatherOptimizationConversionPattern::
-// analyze(): identical matching rules, but classification comes from
-// ReadOnlyOffsetClassifier instead of the mutating OffsetAnalysis::parse, and
-// shape recovery is anchored per-axis instead of by a flattened positional
-// walk (see findAxisDimension).
+// Matches a tt.load against the gather pattern and recovers the shape info
+// buildGatherRewrite needs, using ReadOnlyOffsetClassifier (never the
+// mutating OffsetAnalysis::parse) and findAxisDimension's per-axis search.
 std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp) {
   auto addPtrOp = loadOp.getPtr().getDefiningOp<triton::AddPtrOp>();
   if (!addPtrOp)
@@ -546,8 +536,8 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp) {
       classifier.classify(baseNotUnstructuredOp->getResult(0));
   const SmallVector<AxisInfo> &baseStructured = baseInfo.getStructured();
 
-  // Determine the gather axis: the single axis, among all but the leading
-  // one, tagged scalarlike in the (pre-index) pointer base's own structure.
+  // The gather axis is the one tagged scalarlike in the pointer base's own
+  // structure: indices vary there, but the base pointer's value doesn't.
   candidate.gatherAxis = 0;
   for (int i = 1; i < baseInfo.getRank(); i++) {
     if (baseStructured[i] == AxisInfo::scalar)
@@ -663,12 +653,6 @@ bool candidatesMatch(const GatherCandidate &stored, const GatherCandidate &fresh
         stored.gatherAxis == fresh.gatherAxis &&
         stored.srcShape == fresh.srcShape;
 }
-
-//===----------------------------------------------------------------------===//
-// reduce<> helper: identical to the former GatherOptimization pass's, moved
-// unchanged since it is only ever invoked from apply(), where mutation is
-// expected.
-//===----------------------------------------------------------------------===//
 
 template <typename TIOp>
 Value reduce(Value inputTensor, Location loc, IRRewriter &rewriter) {
