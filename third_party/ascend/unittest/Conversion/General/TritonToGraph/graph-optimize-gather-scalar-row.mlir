@@ -1,11 +1,8 @@
 // RUN: triton-opt --triton-to-structured -graph-optimize='rule-mask=512' %s | FileCheck %s
 
-// Covers a shape findAxisDimension's tt.expand_dims anchor cannot see at
-// all: one row is processed per scf.for iteration, so the row's entire
-// source offset is a plain scalar ("(program_id*tile+%rb) * 1024"),
-// broadcast to the tile shape by a single tt.splat instead of being built up
-// axis by axis with tt.expand_dims/tt.broadcast. See
-// findScalarAxisDimension's fallback in GatherOptimizationRule.cpp.
+// Covers a shape with no tt.expand_dims to anchor on: one row per scf.for
+// iteration, so the source offset is a scalar splat instead of built up
+// axis by axis. See findScalarAxisDimension in GatherOptimizationRule.cpp.
 
 // CHECK:   scf.if {{%[0-9]+}}
 // CHECK:   tt.load {{%[0-9]+}} {gather.optimised.load = "source"} : tensor<1x1024x!tt.ptr<f32>>

@@ -1,11 +1,8 @@
 // RUN: triton-opt --triton-to-structured -graph-optimize='rule-mask=512' %s | FileCheck %s
 
-// GatherOptimization (bit 512, see GraphOptimizationRuleId in
-// TritonToGraph/GraphOptimization.h) is exercised here on TTIR that has
-// already gone through --triton-to-structured, matching where it actually
-// runs in the pipeline (a second graph-optimize instance in
-// ttir_to_linalg, scoped to just this rule -- see compiler.py). Its
-// analysis is not validated against pre-structured TTIR.
+// GatherOptimization runs on structured TTIR here, matching its pipeline
+// position (a second graph-optimize instance in ttir_to_linalg, see
+// compiler.py); not validated against pre-structure TTIR.
 
 // CHECK:   scf.if {{%[0-9]+}}
 // CHECK:   tt.load {{%[0-9]+}} {gather.optimised.load = "source"} : tensor<2x16x64x!tt.ptr<f32>>
