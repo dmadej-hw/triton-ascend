@@ -78,9 +78,8 @@ from triton.runtime.cache import get_dump_manager
 # Bit for GraphOptimizationRuleId::GatherOptimization (see
 # third_party/ascend/include/TritonToGraph/GraphOptimization.h).
 #
-# v2 experiment (this branch): Gather now only runs in make_ttir's instance,
-# pre-triton-to-structure, no fallback -- whatever it can't match here just
-# doesn't get optimized, so we see the real pre-structure hit rate.
+# Runs only in make_ttir's instance, pre-triton-to-structure, with no
+# fallback: whatever it can't match there just doesn't get optimized.
 _GATHER_OPTIMIZATION_RULE_MASK = 512
 
 
@@ -186,8 +185,6 @@ def make_ttir(mod, metadata, opt):
     passes.common.add_symbol_dce(pm)
     passes.ttir.add_loop_unroll(pm)
     if opt.enable_graph_optimize:
-        # v2 experiment: Gather now runs here too, pre-triton-to-structure,
-        # with no later fallback -- see what candidates match at this stage.
         ascend.passes.ttir.add_graph_optimize(
             pm,
             rule_mask=opt.graph_optimize_rule_mask,
