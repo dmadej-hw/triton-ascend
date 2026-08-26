@@ -541,21 +541,28 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp) {
   for (int axis = 1; axis < candidate.indexRank; axis++) {
     std::optional<int64_t> dim =
         findAxisDimension(srcAnalysisStart, indicesOp, axis);
+    const char *tier = "muli";
     if (!dim && axis == 1) {
       if (std::optional<ScalarAxisMatch> scalarMatch =
               findScalarAxisDimension(srcAnalysisStart, indicesOp, classifier)) {
         dim = scalarMatch->dimension;
         scalarRowCarrier = scalarMatch->carrier;
+        tier = "scalar-row";
       }
     }
-    if (!dim)
+    if (!dim) {
       dim = findFoldedUnitAxisDimension(srcAnalysisStart, indicesOp, axis);
+      tier = "folded-unit(=1)";
+    }
     if (!dim) {
       LLVM_DEBUG(llvm::dbgs() << "[GatherOptimization] could not recover "
                                  "source dimension for axis "
                               << axis << "\n");
       return std::nullopt;
     }
+    LLVM_DEBUG(llvm::dbgs() << "[GatherOptimization] axis " << axis
+                           << " dimension " << *dim << " via " << tier
+                           << "\n");
     candidate.srcShape.push_back(*dim);
   }
 
