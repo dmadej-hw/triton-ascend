@@ -507,24 +507,26 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp) {
     }
   }
   if (candidate.gatherAxis == 0) {
-    // A gather axis sized 1 in both src and indices is tagged scalar, not
-    // scalarlike. If exactly one axis is tagged scalar, try it instead.
-    int scalarAxis = 0;
+    // Size-1 axes tag scalar, not scalarlike, so several can be candidates
+    // here; below just picks among them, it doesn't decide who qualifies.
+    SmallVector<int> scalarCandidates;
     for (int i = 1; i < baseInfo.getRank(); i++) {
-      if (baseStructured[i] != AxisInfo::scalar)
-        continue;
-      if (scalarAxis != 0) {
-        scalarAxis = 0;
-        break;
-      }
-      scalarAxis = i;
+      if (baseStructured[i] == AxisInfo::scalar)
+        scalarCandidates.push_back(i);
     }
-    candidate.gatherAxis = scalarAxis;
+    if (scalarCandidates.size() == 1)
+      candidate.gatherAxis = scalarCandidates[0];
+    else if (llvm::is_contained(scalarCandidates, candidate.indexRank - 1))
+      candidate.gatherAxis = candidate.indexRank - 1;
   }
   if (candidate.gatherAxis == 0)
     return std::nullopt;
-  if (candidate.gatherAxis != candidate.indexRank - 1)
-    return std::nullopt; // Non-last-axis gather is out of scope.
+  if (candidate.gatherAxis != candidate.indexRank - 1) {
+    LLVM_DEBUG(llvm::dbgs() << "[GatherOptimization] detected gather axis "
+                           << candidate.gatherAxis
+                           << ", but only the last axis is in scope\n");
+    return std::nullopt;
+  }
 
   Operation *srcSplat =
       findPrecedingOpWithCondition(analyzedOp, isSplatOfBlockArgPointer, stopIndices);
