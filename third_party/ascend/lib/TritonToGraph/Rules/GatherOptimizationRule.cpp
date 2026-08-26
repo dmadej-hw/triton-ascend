@@ -507,7 +507,7 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp) {
   }
   if (candidate.gatherAxis == 0) {
     // Size-1 axes tag scalar, not scalarlike, so several can be candidates
-    // here; below just picks among them, it doesn't decide who qualifies.
+    // here with nothing to tell them apart; only accept an unambiguous one.
     SmallVector<int> scalarCandidates;
     for (int i = 1; i < baseInfo.getRank(); i++) {
       if (baseStructured[i] == AxisInfo::scalar)
@@ -515,8 +515,6 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp) {
     }
     if (scalarCandidates.size() == 1)
       candidate.gatherAxis = scalarCandidates[0];
-    else if (llvm::is_contained(scalarCandidates, candidate.indexRank - 1))
-      candidate.gatherAxis = candidate.indexRank - 1;
   }
   if (candidate.gatherAxis == 0)
     return std::nullopt;
