@@ -25,7 +25,6 @@
 
 #include "ascend/include/Utils/Utils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -719,9 +718,6 @@ private:
     auto cond = rewriter.create<arith::AndIOp>(loc, maxCond.getResult(),
                                                minCond.getResult());
 
-    auto outputTensor = rewriter.create<tensor::EmptyOp>(
-        loc, indicesShape, loadTensorType.getElementType());
-
     auto ifOp = rewriter.create<scf::IfOp>(loc, /*yieldType=*/loadOp.getType(),
                                            cond, /*hasElse=*/true);
     {
@@ -819,10 +815,7 @@ private:
       auto gather = thenBuilder.create<triton::GatherOp>(
           loc, loadTensorType, input, indexNormalized,
           candidate.indexRank - 1);
-      auto copyOp = thenBuilder.create<linalg::CopyOp>(
-          loc, TypeRange{outputTensor.getType()}, ValueRange{gather},
-          ValueRange{outputTensor});
-      thenBuilder.create<scf::YieldOp>(loc, copyOp->getResult(0));
+      thenBuilder.create<scf::YieldOp>(loc, gather->getResult(0));
     }
     {
       OpBuilder elseBuilder = ifOp.getElseBodyBuilder(rewriter.getListener());
@@ -830,10 +823,7 @@ private:
       Operation *clonedLoad = elseBuilder.clone(*loadOp, mapping);
       clonedLoad->setAttr(kGatherOptimisedLoadAttr,
                           StringAttr::get(clonedLoad->getContext(), "fallback"));
-      auto copyOp = elseBuilder.create<linalg::CopyOp>(
-          loc, TypeRange{outputTensor.getType()},
-          ValueRange{clonedLoad->getResult(0)}, ValueRange{outputTensor});
-      elseBuilder.create<scf::YieldOp>(loc, copyOp->getResult(0));
+      elseBuilder.create<scf::YieldOp>(loc, clonedLoad->getResult(0));
     }
 
     rewriter.replaceOp(loadOp, ifOp.getResult(0));
