@@ -744,9 +744,12 @@ private:
           gatherStrides[i] = 1;
           gatherShape[i] =
               (static_cast<int>(i) == gatherAxis) ? srcShape[i] : indicesShape[i];
-          auto rangeTy = RankedTensorType::get({gatherShape[i]}, i32Type);
+          // The range here builds the offset grid for loading the full
+          // srcShape-sized tile, not the (possibly smaller) gatherShape --
+          // that's sliced out of the loaded tile afterwards.
+          auto rangeTy = RankedTensorType::get({srcShape[i]}, i32Type);
           Value range = thenBuilder.create<triton::MakeRangeOp>(
-              loc, rangeTy, 0, gatherShape[i]);
+              loc, rangeTy, 0, srcShape[i]);
           Value expanded;
           if (i == 0 && rowOffset) {
             auto offset =
