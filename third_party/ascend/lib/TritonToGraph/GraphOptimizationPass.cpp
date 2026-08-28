@@ -500,7 +500,7 @@ void populateBuiltinGraphOptimizationRules(
   }
   if (isRuleEnabled(options.enabledRuleMask,
                     GraphOptimizationRuleId::GatherOptimization)) {
-    rules.push_back(createGatherOptimizationRule());
+    rules.push_back(createGatherOptimizationRule(options.ubCapacityBytes));
   }
   if (options.forceSimtOnly &&
       isRuleEnabled(options.enabledRuleMask,

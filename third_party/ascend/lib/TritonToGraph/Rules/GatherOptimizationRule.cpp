@@ -39,6 +39,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Debug.h"
 
+#include <algorithm>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -301,6 +302,111 @@ bool isIntegerTensorType(Type type, int &rankOut) {
   return true;
 }
 
+std::optional<uint64_t> getByteWidth(Type type) {
+  unsigned bitWidth = 0;
+  if (auto integerType = dyn_cast<IntegerType>(type))
+    bitWidth = integerType.getWidth();
+  else if (auto floatType = dyn_cast<FloatType>(type))
+    bitWidth = floatType.getWidth();
+  else
+    return std::nullopt;
+  if (bitWidth == 0 || bitWidth % 8 != 0)
+    return std::nullopt;
+  return static_cast<uint64_t>(bitWidth / 8);
+}
+
+bool checkedMulU64(uint64_t lhs, uint64_t rhs, uint64_t &result) {
+  if (lhs != 0 && rhs > std::numeric_limits<uint64_t>::max() / lhs)
+    return false;
+  result = lhs * rhs;
+  return true;
+}
+
+bool checkedAddU64(uint64_t lhs, uint64_t rhs, uint64_t &result) {
+  if (rhs > std::numeric_limits<uint64_t>::max() - lhs)
+    return false;
+  result = lhs + rhs;
+  return true;
+}
+
+// UB allocations are padded to a 32-byte block on the last axis.
+constexpr uint64_t kUbBlockBytes = 32;
+
+uint64_t roundUpToBlock(uint64_t bytes) {
+  return (bytes + kUbBlockBytes - 1) / kUbBlockBytes * kUbBlockBytes;
+}
+
+// Total bytes for a tensor of this shape/element size, with its last axis
+// padded to a 32-byte block (matching how it's actually laid out in UB).
+// Returns nullopt on overflow.
+std::optional<uint64_t> tileBytes(ArrayRef<int64_t> shape, uint64_t elemBytes) {
+  if (shape.empty())
+    return elemBytes;
+  uint64_t outerElements = 1;
+  for (int64_t dim : shape.drop_back())
+    if (!checkedMulU64(outerElements, static_cast<uint64_t>(dim),
+                       outerElements))
+      return std::nullopt;
+  uint64_t lastAxisBytes = 0;
+  if (!checkedMulU64(static_cast<uint64_t>(shape.back()), elemBytes,
+                     lastAxisBytes))
+    return std::nullopt;
+  uint64_t paddedLastAxisBytes = roundUpToBlock(lastAxisBytes);
+  uint64_t total = 0;
+  if (!checkedMulU64(outerElements, paddedLastAxisBytes, total))
+    return std::nullopt;
+  return total;
+}
+
+// Empirically fit against real UB-overflow measurements (src/idx shapes of
+// varying rank and dtype, both aligned and deliberately unaligned last
+// axes): actual usage = 2x the source tile, plus, of the index-shaped
+// footprint (last axis padded to a 32-byte block like the source tile),
+// 3x at the gather-output element size and 4x at the index element size.
+// Exact to the bit across every measurement taken, including mixed
+// float16/int32 shapes that separated the two index-footprint terms.
+constexpr uint64_t kSrcTileMultiplier = 2;
+constexpr uint64_t kIndexFootprintAtLoadElemMultiplier = 3;
+constexpr uint64_t kIndexFootprintAtIndexElemMultiplier = 4;
+
+bool exceedsUbCapacity(ArrayRef<int64_t> srcShape,
+                       ArrayRef<int64_t> indicesShape, Type loadElementType,
+                       Type indexElementType, unsigned ubCapacityBytes) {
+  if (ubCapacityBytes == 0)
+    return false;
+  std::optional<uint64_t> loadElemBytes = getByteWidth(loadElementType);
+  std::optional<uint64_t> indexElemBytes = getByteWidth(indexElementType);
+  if (!loadElemBytes || !indexElemBytes)
+    return true; // Unknown element size: don't risk it.
+
+  std::optional<uint64_t> srcTileBytes = tileBytes(srcShape, *loadElemBytes);
+  std::optional<uint64_t> idxAtLoadElemBytes =
+      tileBytes(indicesShape, *loadElemBytes);
+  std::optional<uint64_t> idxAtIndexElemBytes =
+      tileBytes(indicesShape, *indexElemBytes);
+  if (!srcTileBytes || !idxAtLoadElemBytes || !idxAtIndexElemBytes)
+    return true;
+  uint64_t srcContribution = 0, idxContribution1 = 0, idxContribution2 = 0,
+           total = 0;
+  if (!checkedMulU64(*srcTileBytes, kSrcTileMultiplier, srcContribution) ||
+      !checkedMulU64(*idxAtLoadElemBytes, kIndexFootprintAtLoadElemMultiplier,
+                     idxContribution1) ||
+      !checkedMulU64(*idxAtIndexElemBytes,
+                     kIndexFootprintAtIndexElemMultiplier, idxContribution2) ||
+      !checkedAddU64(srcContribution, idxContribution1, total) ||
+      !checkedAddU64(total, idxContribution2, total))
+    return true;
+
+  // ubCapacityBytes is graph_ub_budget_bytes_for_arch (raw/2, a margin sized
+  // for StoreCoalescing's less precise model); this formula is fit directly
+  // against real overflow measurements, so compare against the raw capacity
+  // instead of compounding both margins.
+  uint64_t rawUbBytes = 0;
+  if (!checkedMulU64(static_cast<uint64_t>(ubCapacityBytes), 2, rawUbBytes))
+    return true;
+  return total > rawUbBytes;
+}
+
 // Extracts the single splat integer constant multiplied in `mulI`.
 std::optional<int64_t> extractMulIConstant(arith::MulIOp mulI) {
   arith::ConstantOp constOp = mulI.getRhs().getDefiningOp<arith::ConstantOp>();
@@ -417,7 +523,8 @@ findScalarAxisDimension(Operation *searchRoot, Operation *indicesOp,
 
 // Matches a tt.load against the gather pattern and recovers its shape,
 // using ReadOnlyOffsetClassifier rather than the mutating OffsetAnalysis::parse.
-std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp) {
+std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp,
+                                                       unsigned ubCapacityBytes) {
   auto addPtrOp = loadOp.getPtr().getDefiningOp<triton::AddPtrOp>();
   if (!addPtrOp)
     return std::nullopt;
@@ -590,6 +697,16 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp) {
     candidate.rowOffset = rank0->getResult(0);
   }
 
+  if (exceedsUbCapacity(candidate.srcShape, loadTensorType.getShape(),
+                       loadTensorType.getElementType(),
+                       cast<TensorType>(candidate.indices.getType())
+                           .getElementType(),
+                       ubCapacityBytes)) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "[GatherOptimization] estimated UB usage exceeds budget\n");
+    return std::nullopt;
+  }
+
   return candidate;
 }
 
@@ -640,10 +757,12 @@ Value reduce(Value inputTensor, Location loc, IRRewriter &rewriter) {
 
 class GatherOptimizationPlan final : public RewritePlan {
 public:
-  GatherOptimizationPlan(GatherCandidate candidate, unsigned epoch)
+  GatherOptimizationPlan(GatherCandidate candidate, unsigned epoch,
+                        unsigned ubCapacityBytes)
       : loadOp(candidate.loadOp), loadOperation(candidate.loadOp.getOperation()),
         indicesElements(computeIndicesElements(candidate)),
-        candidate(std::move(candidate)), epoch(epoch) {}
+        candidate(std::move(candidate)), epoch(epoch),
+        ubCapacityBytes(ubCapacityBytes) {}
 
   GraphOptimizationRuleId getRuleId() const override {
     return GraphOptimizationRuleId::GatherOptimization;
@@ -666,14 +785,16 @@ public:
       return failure();
     if (loadOp->getAttr(kGatherOptimisedLoadAttr))
       return failure();
-    std::optional<GatherCandidate> fresh = analyzeGatherCandidate(loadOp);
+    std::optional<GatherCandidate> fresh =
+        analyzeGatherCandidate(loadOp, ubCapacityBytes);
     return success(fresh && candidatesMatch(candidate, *fresh));
   }
 
   LogicalResult apply(IRRewriter &rewriter) override {
     // Re-derive before mutating, like revalidate(): a stale plan must never
     // be able to mutate the IR.
-    std::optional<GatherCandidate> fresh = analyzeGatherCandidate(loadOp);
+    std::optional<GatherCandidate> fresh =
+        analyzeGatherCandidate(loadOp, ubCapacityBytes);
     if (!fresh || !candidatesMatch(candidate, *fresh))
       return failure();
     return buildGatherRewrite(*fresh, rewriter);
@@ -849,10 +970,14 @@ private:
   int64_t indicesElements;
   GatherCandidate candidate;
   unsigned epoch;
+  unsigned ubCapacityBytes;
 };
 
 class GatherOptimizationRule final : public GraphOptimizationRule {
 public:
+  explicit GatherOptimizationRule(unsigned ubCapacityBytes)
+      : ubCapacityBytes(ubCapacityBytes) {}
+
   GraphOptimizationRuleId getId() const override {
     return GraphOptimizationRuleId::GatherOptimization;
   }
@@ -870,18 +995,23 @@ public:
       // re-walks the whole function every iteration anyway.
       if (loadOp->getAttr(kGatherOptimisedLoadAttr))
         return;
-      std::optional<GatherCandidate> candidate = analyzeGatherCandidate(loadOp);
+      std::optional<GatherCandidate> candidate =
+          analyzeGatherCandidate(loadOp, ubCapacityBytes);
       if (!candidate)
         return;
       plans.push_back(std::make_unique<GatherOptimizationPlan>(
-          std::move(*candidate), context.getEpoch()));
+          std::move(*candidate), context.getEpoch(), ubCapacityBytes));
     });
     return success();
   }
+
+private:
+  unsigned ubCapacityBytes;
 };
 
 } // namespace
 
-std::unique_ptr<GraphOptimizationRule> cfg::createGatherOptimizationRule() {
-  return std::make_unique<GatherOptimizationRule>();
+std::unique_ptr<GraphOptimizationRule>
+cfg::createGatherOptimizationRule(unsigned ubCapacityBytes) {
+  return std::make_unique<GatherOptimizationRule>(ubCapacityBytes);
 }
