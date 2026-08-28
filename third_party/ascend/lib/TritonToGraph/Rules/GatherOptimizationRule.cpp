@@ -540,8 +540,13 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp,
   ReadOnlyOffsetClassifier classifier;
   Value offsetValue = addPtrOp.getOffset();
   const PtrOffsetInfo &offsetInfo = classifier.classify(offsetValue);
-  if (!offsetInfo.isUnstructured() || offsetInfo.getRank() == 1)
-    return std::nullopt; // Rank 1 is 'index select', handled elsewhere.
+  if (!offsetInfo.isUnstructured())
+    return std::nullopt;
+  if (offsetInfo.getRank() == 1) {
+    LLVM_DEBUG(llvm::dbgs() << "[GatherOptimization] rank 1 is 'index "
+                              "select', handled elsewhere\n");
+    return std::nullopt;
+  }
 
   Operation *analyzedOp = addPtrOp.getOperation();
 
@@ -565,9 +570,13 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp,
   candidate.addPtrOp = addPtrOp;
   candidate.indices = indicesOp->getResult(0);
 
-  if (!isIntegerTensorType(candidate.indices.getType(), candidate.indexRank) ||
-      candidate.indexRank > 5)
+  if (!isIntegerTensorType(candidate.indices.getType(), candidate.indexRank))
     return std::nullopt;
+  if (candidate.indexRank > 5) {
+    LLVM_DEBUG(llvm::dbgs() << "[GatherOptimization] rank " << candidate.indexRank
+                           << " exceeds the supported maximum of 5\n");
+    return std::nullopt;
+  }
 
   std::function<bool(Operation *)> stopIndices = [&](Operation *op) -> bool {
     return op == indicesOp;
@@ -620,8 +629,13 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp,
       if (baseStructured[i] == AxisInfo::scalar)
         scalarCandidates.push_back(i);
     }
-    if (scalarCandidates.size() == 1)
+    if (scalarCandidates.size() == 1) {
       candidate.gatherAxis = scalarCandidates[0];
+    } else if (scalarCandidates.size() > 1) {
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[GatherOptimization] size-1 gather-axis candidates are "
+                    "ambiguous\n");
+    }
   }
   if (candidate.gatherAxis == 0)
     return std::nullopt;
