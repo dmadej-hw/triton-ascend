@@ -704,6 +704,12 @@ private:
     Value srcPtr = candidate.srcPtr;
     Value ourIndices = candidate.indices;
 
+    // Both reduce<> calls below share this precondition; check it once here,
+    // before either creates anything, rather than relying on them failing
+    // identically (true today only because they share the same input).
+    if (!isa<RankedTensorType>(ourIndices.getType()))
+      return failure();
+
     Location loc = loadOp.getLoc();
     rewriter.setInsertionPoint(loadOp);
 
