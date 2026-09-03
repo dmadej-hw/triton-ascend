@@ -79,6 +79,8 @@ getGraphOptimizationRuleName(GraphOptimizationRuleId rule) {
     return "DiagonalMaskRemoval";
   case GraphOptimizationRuleId::ConvertModuloToMask:
     return "ConvertModuloToMask";
+  case GraphOptimizationRuleId::GatherOptimization:
+    return "GatherOptimization";
   case GraphOptimizationRuleId::StridedAxisCoalescing:
     return "StridedAxisCoalescing";
   case GraphOptimizationRuleId::ChunkCoalescing:
