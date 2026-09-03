@@ -178,6 +178,7 @@ def make_ttir(mod, metadata, opt):
     if opt.enable_graph_optimize:
         ascend.passes.ttir.add_graph_optimize(
             pm,
+            rule_mask=opt.graph_optimize_rule_mask,
             ub_capacity_bytes=graph_ub_budget_bytes_for_arch(opt.target_arch),
             compile_mode=opt.compile_mode,
         )
