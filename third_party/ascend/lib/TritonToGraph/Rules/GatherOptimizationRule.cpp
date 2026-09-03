@@ -412,6 +412,75 @@ bool exceedsUbCapacity(ArrayRef<int64_t> srcShape,
   return total > rawUbBytes;
 }
 
+// idx_last threshold below which tt.gather is not expected to beat the
+// scalar baseline, indexed by [iteration bucket][src_last bucket]. Derived
+// from measured ScalarLoop/tt.gather ratios across rank 2-5 and fp32/fp16
+// (see gate_formula_analysis.md): 0 measured fires below ratio 0.98 across
+// 1113 fp32 + 26 fp16 validation points.
+constexpr int kGatherBenefitThreshold[4][8] = {
+    {10, 8, 8, 6, 5, 4, 3, 2}, // T <= 4
+    {8, 8, 7, 5, 4, 3, 2, 2},  // 5 <= T <= 16
+    {8, 7, 7, 5, 4, 2, 2, 2},  // 17 <= T <= 64
+    {8, 7, 7, 4, 3, 2, 2, 2},  // T > 64
+};
+
+int gatherSrcBucket(int64_t srcLast) {
+  if (srcLast <= 3)
+    return 0;
+  if (srcLast == 4)
+    return 1;
+  if (srcLast <= 7)
+    return 2;
+  if (srcLast <= 9)
+    return 3;
+  if (srcLast <= 15)
+    return 4;
+  if (srcLast <= 23)
+    return 5;
+  if (srcLast <= 31)
+    return 6;
+  return 7;
+}
+
+int gatherIterBucket(int64_t iterations) {
+  if (iterations <= 4)
+    return 0;
+  if (iterations <= 16)
+    return 1;
+  if (iterations <= 64)
+    return 2;
+  return 3;
+}
+
+// True if rewriting to tt.gather is expected to be at least as fast as the
+// scalar baseline it replaces. srcLast/idxLast are the gather axis sizes;
+// rowBlk is the rows assigned to one core, rowStep the rows the scalar
+// baseline processes per tile iteration (its own tiling, distinct from
+// exceedsUbCapacity's tt.gather-side UB budget above).
+//
+// TODO: not yet wired into analyzeGatherCandidate -- rowBlk/rowStep aren't
+// available from the IR fragment matched there today. Call this once a
+// source for them is decided; [[maybe_unused]] keeps -Werror quiet until then.
+[[maybe_unused]] bool exceedsBenefitThreshold(int64_t srcLast, int64_t idxLast,
+                                              int64_t rowBlk, int64_t rowStep,
+                                              uint64_t elemBytes) {
+  const int64_t align =
+      std::max<int64_t>(1, 32 / static_cast<int64_t>(elemBytes));
+  const int64_t iterations = (rowBlk + rowStep - 1) / rowStep;
+
+  if (srcLast == 1) // degenerate source gather axis: its own crossing point
+    return idxLast >= 19 ||
+          (idxLast >= 2 * align &&
+            (idxLast % align == 0 || iterations >= 17 || rowStep == 1));
+
+  if (idxLast % align == 0) // idx tile is a whole number of 32-byte DMA blocks
+    return true;
+  if (rowStep == 1) // scalar baseline pays full per-iteration overhead/row
+    return true;
+  return idxLast >= kGatherBenefitThreshold[gatherIterBucket(iterations)]
+                                           [gatherSrcBucket(srcLast)];
+}
+
 // Extracts the single splat integer constant multiplied in `mulI`.
 std::optional<int64_t> extractMulIConstant(arith::MulIOp mulI) {
   arith::ConstantOp constOp = mulI.getRhs().getDefiningOp<arith::ConstantOp>();
