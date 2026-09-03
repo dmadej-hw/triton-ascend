@@ -27,6 +27,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
@@ -457,13 +458,8 @@ int gatherIterBucket(int64_t iterations) {
 // rowBlk is the rows assigned to one core, rowStep the rows the scalar
 // baseline processes per tile iteration (its own tiling, distinct from
 // exceedsUbCapacity's tt.gather-side UB budget above).
-//
-// TODO: not yet wired into analyzeGatherCandidate -- rowBlk/rowStep aren't
-// available from the IR fragment matched there today. Call this once a
-// source for them is decided; [[maybe_unused]] keeps -Werror quiet until then.
-[[maybe_unused]] bool exceedsBenefitThreshold(int64_t srcLast, int64_t idxLast,
-                                              int64_t rowBlk, int64_t rowStep,
-                                              uint64_t elemBytes) {
+bool exceedsBenefitThreshold(int64_t srcLast, int64_t idxLast, int64_t rowBlk,
+                             int64_t rowStep, uint64_t elemBytes) {
   const int64_t align =
       std::max<int64_t>(1, 32 / static_cast<int64_t>(elemBytes));
   const int64_t iterations = (rowBlk + rowStep - 1) / rowStep;
@@ -479,6 +475,25 @@ int gatherIterBucket(int64_t iterations) {
     return true;
   return idxLast >= kGatherBenefitThreshold[gatherIterBucket(iterations)]
                                            [gatherSrcBucket(srcLast)];
+}
+
+// rowBlk: the upper bound of the nearest enclosing scf.for whose step
+// matches rowStep -- the loop tiling the matched pattern's own row
+// dimension into rowStep-sized chunks per iteration. Searches from the
+// matched op itself, not from rowOffset's defining op: rowOffset is
+// typically `program_id * rowBlk`, hoisted outside any such loop. Absent a
+// matching loop (or an unresolvable bound), the whole block is handled in
+// one shot, i.e. rowBlk == rowStep.
+int64_t findRowBlk(Operation *anchor, int64_t rowStep) {
+  auto forOp = anchor->getParentOfType<scf::ForOp>();
+  if (!forOp)
+    return rowStep;
+  std::optional<int64_t> step = getConstantIntValue(forOp.getStep());
+  std::optional<int64_t> upperBound =
+      getConstantIntValue(forOp.getUpperBound());
+  if (!step || *step != rowStep || !upperBound)
+    return rowStep;
+  return *upperBound;
 }
 
 // Extracts the single splat integer constant multiplied in `mulI`.
@@ -787,6 +802,23 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp,
                        ubCapacityBytes)) {
     LLVM_DEBUG(llvm::dbgs()
                << "[GatherOptimization] estimated UB usage exceeds budget\n");
+    return std::nullopt;
+  }
+
+  // The matched pattern's own row-dim size is the scalar baseline's
+  // per-iteration row count (rowStep); see findRowBlk for how rowBlk is
+  // recovered from the loop tiling it.
+  std::optional<uint64_t> loadElemBytes =
+      getByteWidth(loadTensorType.getElementType());
+  if (!loadElemBytes)
+    return std::nullopt;
+  int64_t rowStep = candidate.srcShape[0];
+  int64_t rowBlk = findRowBlk(candidate.addPtrOp, rowStep);
+  if (!exceedsBenefitThreshold(candidate.srcShape.back(), indexShape.back(),
+                               rowBlk, rowStep, *loadElemBytes)) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "[GatherOptimization] rewrite not expected to beat the "
+                  "scalar baseline\n");
     return std::nullopt;
   }
 
