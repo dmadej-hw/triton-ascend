@@ -302,6 +302,11 @@ bool isIntegerTensorType(Type type, int &rankOut) {
   return true;
 }
 
+// tt.gather only supports these element types for the gathered value.
+bool isSupportedGatherValueType(Type elementType) {
+  return elementType.isF16() || elementType.isF32() || elementType.isBF16();
+}
+
 std::optional<uint64_t> getByteWidth(Type type) {
   unsigned bitWidth = 0;
   if (auto integerType = dyn_cast<IntegerType>(type))
@@ -533,6 +538,8 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp,
   auto ptrTensorType = dyn_cast<TensorType>(loadOp.getPtr().getType());
   if (!loadTensorType || !ptrTensorType ||
       loadTensorType.getShape() != ptrTensorType.getShape())
+    return std::nullopt;
+  if (!isSupportedGatherValueType(loadTensorType.getElementType()))
     return std::nullopt;
 
   // Classify only the offset side of the outer addptr: a plain tt.splat base
