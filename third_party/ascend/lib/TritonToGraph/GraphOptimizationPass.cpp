@@ -212,8 +212,8 @@ void GraphOptimizePass::runOnOperation() {
     llvm::dbgs() << "[graph-optimize] rule-mask="
                 << static_cast<unsigned>(options.enabledRuleMask)
                 << " max-rewrites-per-function="
-                << options.maxRewritesPerFunction << " force-simt-only="
-                << (options.forceSimtOnly ? "true" : "false")
+                << options.maxRewritesPerFunction
+                << " compile-mode=" << options.compileMode
                 << " enabled rules:";
     for (GraphOptimizationRule *rule : enabledRules)
       llvm::dbgs() << " " << ruleIdToString(rule->getId());
