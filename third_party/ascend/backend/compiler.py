@@ -74,14 +74,6 @@ from triton.backends.compiler import (
 )
 from triton.runtime.cache import get_dump_manager
 
-# Bit for GraphOptimizationRuleId::GatherOptimization (see
-# third_party/ascend/include/TritonToGraph/GraphOptimization.h).
-#
-# Runs only in make_ttir's instance, pre-triton-to-structure, with no
-# fallback: whatever it can't match there just doesn't get optimized.
-_GATHER_OPTIMIZATION_RULE_MASK = 512
-
-
 # TODO: materialize the concrete min shape
 def min_dot_size(target: GPUTarget):
     return lambda lhsType, rhsType: (1, 1, 1)
@@ -1057,9 +1049,8 @@ class NPUOptions:
     backend_name: str = 'cann'
     instrumentation_mode: str = ""
     enable_graph_optimize: bool = True
-    # 511 = the 9 non-Gather rules; | _GATHER_OPTIMIZATION_RULE_MASK (bit 512)
-    # keeps Gather enabled by default too.
-    graph_optimize_rule_mask: int = 511 | _GATHER_OPTIMIZATION_RULE_MASK
+    # 1023 = all 10 rules, GatherOptimization (bit 512) included.
+    graph_optimize_rule_mask: int = 1023
     graph_optimize_max_rewrites_per_function: int = 64
     graph_optimize_ub_capacity_bytes: Optional[int] = None
     graph_optimize_emit_remarks: bool = False
