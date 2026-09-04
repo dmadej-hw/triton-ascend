@@ -410,7 +410,14 @@ bool exceedsUbCapacity(ArrayRef<int64_t> srcShape,
   uint64_t rawUbBytes = 0;
   if (!checkedMulU64(static_cast<uint64_t>(ubCapacityBytes), 2, rawUbBytes))
     return true;
-  return total > rawUbBytes;
+
+  // A real device crash (VEC "ub address out of bounds") was hit at 196512
+  // bytes against a 196608 raw budget -- 96 bytes of "safe" margin per this
+  // formula, evidently not actually safe. Reserve 5% of the raw budget
+  // (~9.8KB at 192KB) so an unmodeled fixed cost like this can't slip
+  // through; this is ~100x the observed overshoot.
+  uint64_t safeUbBytes = rawUbBytes - rawUbBytes / 20;
+  return total > safeUbBytes;
 }
 
 // idx_last threshold below which tt.gather is not expected to beat the
