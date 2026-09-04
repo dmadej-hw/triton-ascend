@@ -465,8 +465,9 @@ int gatherIterBucket(int64_t iterations) {
 // rowBlk is the rows assigned to one core, rowStep the rows the scalar
 // baseline processes per tile iteration (its own tiling, distinct from
 // exceedsUbCapacity's tt.gather-side UB budget above).
-bool exceedsBenefitThreshold(int64_t srcLast, int64_t idxLast, int64_t rowBlk,
-                             int64_t rowStep, uint64_t elemBytes) {
+[[maybe_unused]] bool exceedsBenefitThreshold(int64_t srcLast, int64_t idxLast,
+                                              int64_t rowBlk, int64_t rowStep,
+                                              uint64_t elemBytes) {
   const int64_t align =
       std::max<int64_t>(1, 32 / static_cast<int64_t>(elemBytes));
   const int64_t iterations = (rowBlk + rowStep - 1) / rowStep;
@@ -491,7 +492,7 @@ bool exceedsBenefitThreshold(int64_t srcLast, int64_t idxLast, int64_t rowBlk,
 // typically `program_id * rowBlk`, hoisted outside any such loop. Absent a
 // matching loop (or an unresolvable bound), the whole block is handled in
 // one shot, i.e. rowBlk == rowStep.
-int64_t findRowBlk(Operation *anchor, int64_t rowStep) {
+[[maybe_unused]] int64_t findRowBlk(Operation *anchor, int64_t rowStep) {
   auto forOp = anchor->getParentOfType<scf::ForOp>();
   if (!forOp)
     return rowStep;
@@ -812,22 +813,23 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp,
     return std::nullopt;
   }
 
-  // The matched pattern's own row-dim size is the scalar baseline's
-  // per-iteration row count (rowStep); see findRowBlk for how rowBlk is
-  // recovered from the loop tiling it.
-  std::optional<uint64_t> loadElemBytes =
-      getByteWidth(loadTensorType.getElementType());
-  if (!loadElemBytes)
-    return std::nullopt;
-  int64_t rowStep = candidate.srcShape[0];
-  int64_t rowBlk = findRowBlk(candidate.addPtrOp, rowStep);
-  if (!exceedsBenefitThreshold(candidate.srcShape.back(), indexShape.back(),
-                               rowBlk, rowStep, *loadElemBytes)) {
-    LLVM_DEBUG(llvm::dbgs()
-               << "[GatherOptimization] rewrite not expected to beat the "
-                  "scalar baseline\n");
-    return std::nullopt;
-  }
+  // TEMPORARY, test-only: benefit gate disabled for a full remeasurement
+  // pass (gate-conditioned GO data can't show what firing everywhere would
+  // actually do -- see gate_formula_fp16_v2.md S2.1). Re-enable before PR.
+  //
+  // std::optional<uint64_t> loadElemBytes =
+  //     getByteWidth(loadTensorType.getElementType());
+  // if (!loadElemBytes)
+  //   return std::nullopt;
+  // int64_t rowStep = candidate.srcShape[0];
+  // int64_t rowBlk = findRowBlk(candidate.addPtrOp, rowStep);
+  // if (!exceedsBenefitThreshold(candidate.srcShape.back(), indexShape.back(),
+  //                              rowBlk, rowStep, *loadElemBytes)) {
+  //   LLVM_DEBUG(llvm::dbgs()
+  //              << "[GatherOptimization] rewrite not expected to beat the "
+  //                 "scalar baseline\n");
+  //   return std::nullopt;
+  // }
 
   return candidate;
 }
