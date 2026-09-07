@@ -27,6 +27,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
@@ -413,6 +414,127 @@ bool exceedsUbCapacity(ArrayRef<int64_t> srcShape,
   return total > safeUbBytes;
 }
 
+// The index tensor is always i32, so its tile row is a whole number of
+// 32-byte UB blocks exactly when idxLast is a multiple of 8 -- independent
+// of the gathered value's element size. fp16 data separates the index tile
+// from the value tile and shows the index tile is what the DMA cares about.
+constexpr int64_t kIndexBlockElems = 8;
+
+// idx_last threshold below which tt.gather is not expected to beat the
+// scalar baseline, indexed by [iteration bucket][src_last bucket]. Derived
+// from measured ScalarLoop/tt.gather ratios across rank 2-5, gate-free:
+// 0 fires below ratio 0.98 on 1760 pooled points, both dtypes.
+constexpr int kGatherBenefitThreshold[4][9] = {
+    {10, 8, 8, 6, 5, 4, 3, 2, 2}, // T <= 4
+    {8, 8, 7, 5, 4, 3, 2, 2, 2},  // 5 <= T <= 16
+    {8, 7, 7, 5, 4, 2, 2, 2, 2},  // 17 <= T <= 64
+    {8, 7, 7, 4, 3, 2, 2, 2, 2},  // T > 64
+};
+
+// 2-byte value types (f16/bf16): half the bytes/element means it amortises
+// slower, so every threshold moves up ~2 src_last buckets. T <= 4 is
+// hardened, not measured -- this harness can't produce a 2-byte T <= 4
+// case above 0.26ms to calibrate it.
+constexpr int kGatherBenefitThresholdHalf[4][9] = {
+    {14, 12, 12, 10, 9, 6, 5, 4, 4}, // T <= 4
+    {12, 10, 10, 7, 6, 5, 4, 3, 2},  // 5 <= T <= 16
+    {12, 10, 10, 7, 6, 5, 4, 3, 2},  // 17 <= T <= 64
+    {12, 10, 10, 7, 6, 5, 4, 3, 2},  // T > 64
+};
+
+int gatherSrcBucket(int64_t srcLast) {
+  if (srcLast <= 3)
+    return 0;
+  if (srcLast == 4)
+    return 1;
+  if (srcLast <= 7)
+    return 2;
+  if (srcLast <= 9)
+    return 3;
+  if (srcLast <= 15)
+    return 4;
+  if (srcLast <= 23)
+    return 5;
+  if (srcLast <= 31)
+    return 6;
+  // A 2-byte source tile only pays for a small index tile once it's wide
+  // enough to hide the gather's own tile load: srcLast 32-44 measure
+  // 0.86-1.05 at idxLast==2 where 48-64 measure 1.04-1.29.
+  if (srcLast <= 47)
+    return 7;
+  return 8;
+}
+
+int gatherIterBucket(int64_t iterations) {
+  if (iterations <= 4)
+    return 0;
+  if (iterations <= 16)
+    return 1;
+  if (iterations <= 64)
+    return 2;
+  return 3;
+}
+
+// True if rewriting to tt.gather is expected to be at least as fast as the
+// scalar baseline it replaces. srcLast/idxLast are the gather axis sizes;
+// rowBlk is the rows assigned to one core, rowStep the rows the scalar
+// baseline processes per tile iteration (its own tiling, distinct from
+// exceedsUbCapacity's tt.gather-side UB budget above).
+bool exceedsBenefitThreshold(int64_t srcLast, int64_t idxLast, int64_t rowBlk,
+                             int64_t rowStep, uint64_t elemBytes) {
+  const bool isHalf = elemBytes < 4;
+  const int64_t iterations = (rowBlk + rowStep - 1) / rowStep;
+
+  // A width-1 source gather axis is a degenerate case with its own, much
+  // later crossing point: tt.gather still pays a full tile load and the
+  // gather op while the scalar baseline has almost nothing to do.
+  if (srcLast == 1) {
+    // At 2 bytes/element nothing below idxLast 25 ever reaches parity (best
+    // 0.974 at 274 iterations); from 32 upwards the rewrite wins 6-27%. No
+    // measurement exists at <=4 iterations, where the branch is 5-10% worse
+    // at every other idxLast, so that corner stays closed.
+    if (isHalf)
+      return iterations >= 5 && idxLast >= 32;
+    // A block-aligned index tile crosses early and stays there.
+    if (idxLast % kIndexBlockElems == 0)
+      return idxLast >= 16;
+    // Few iterations: the scalar baseline pays its per-iteration overhead
+    // only a handful of times and keeps winning far longer.
+    if (iterations <= 4)
+      return idxLast >= 32;
+    if (iterations >= 17 || rowStep == 1)
+      return idxLast >= 16;
+    return idxLast >= 19;
+  }
+
+  if (idxLast % kIndexBlockElems == 0) // idx tile is whole 32-byte DMA blocks
+    return true;
+  if (rowStep == 1) // scalar baseline pays full per-iteration overhead/row
+    return true;
+
+  const auto &table =
+      isHalf ? kGatherBenefitThresholdHalf : kGatherBenefitThreshold;
+  return table[gatherIterBucket(iterations)][gatherSrcBucket(srcLast)] <=
+         idxLast;
+}
+
+// rowBlk: the upper bound of the nearest enclosing scf.for whose step
+// matches rowStep -- the loop tiling the row dimension into rowStep-sized
+// chunks. Searched from the matched op, not rowOffset's defining op:
+// rowOffset (`program_id * rowBlk`) is typically hoisted outside that loop.
+// No matching loop -> the whole block runs in one shot, rowBlk == rowStep.
+int64_t findRowBlk(Operation *anchor, int64_t rowStep) {
+  auto forOp = anchor->getParentOfType<scf::ForOp>();
+  if (!forOp)
+    return rowStep;
+  std::optional<int64_t> step = getConstantIntValue(forOp.getStep());
+  std::optional<int64_t> upperBound =
+      getConstantIntValue(forOp.getUpperBound());
+  if (!step || *step != rowStep || !upperBound)
+    return rowStep;
+  return *upperBound;
+}
+
 // Extracts the single splat integer constant multiplied in `mulI`.
 std::optional<int64_t> extractMulIConstant(arith::MulIOp mulI) {
   arith::ConstantOp constOp = mulI.getRhs().getDefiningOp<arith::ConstantOp>();
@@ -719,6 +841,23 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp,
                        ubCapacityBytes)) {
     LLVM_DEBUG(llvm::dbgs()
                << "[GatherOptimization] estimated UB usage exceeds budget\n");
+    return std::nullopt;
+  }
+
+  // The matched pattern's own row-dim size is the scalar baseline's
+  // per-iteration row count (rowStep); see findRowBlk for how rowBlk is
+  // recovered from the loop tiling it.
+  std::optional<uint64_t> loadElemBytes =
+      getByteWidth(loadTensorType.getElementType());
+  if (!loadElemBytes)
+    return std::nullopt;
+  int64_t rowStep = candidate.srcShape[0];
+  int64_t rowBlk = findRowBlk(candidate.addPtrOp, rowStep);
+  if (!exceedsBenefitThreshold(candidate.srcShape.back(), indexShape.back(),
+                               rowBlk, rowStep, *loadElemBytes)) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "[GatherOptimization] rewrite not expected to beat the "
+                  "scalar baseline\n");
     return std::nullopt;
   }
 
