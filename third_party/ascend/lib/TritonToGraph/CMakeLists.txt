@@ -18,6 +18,7 @@ add_triton_library(TritonToGraph
   LegacyMemoryAccess/StridedLoadStoreRewrite.cpp
   Rules/ConvertModuloToMaskRule.cpp
   Rules/DiagonalMaskRemovalRule.cpp
+  Rules/GatherOptimizationRule.cpp
   Rules/LoadStoreTransposeRule.cpp
   Rules/RowCoalescingRule.cpp
   Rules/TransposePointwiseReorderRule.cpp
@@ -48,5 +49,9 @@ add_triton_library(TritonToGraph
   TritonIR
   TritonMemoryAccessAnalysis
   TritonToStructured
+  # GatherOptimizationRule reuses TritonToUnstructure::PtrOffsetInfo/AxisInfo
+  # and combineInfo() as plain data types/pure helpers (never the mutating
+  # OffsetAnalysis::parse family) -- see Rules/GatherOptimizationRule.cpp.
+  TritonToUnstructure
   TritonTransforms
 )

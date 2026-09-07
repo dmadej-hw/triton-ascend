@@ -51,6 +51,11 @@ enum class GraphOptimizationRuleId : uint16_t {
   // ConvertModuloToMask linearizes wrapped tile addresses.  It runs before the
   // memory-access rules so they see the linear form.
   ConvertModuloToMask = 256,
+  // GatherOptimization rewrites a fully-unstructured tt.load (indices computed
+  // at runtime) into a runtime-bounds-checked tt.gather with a fallback to the
+  // original load.  Its own analysis intentionally never depends on the
+  // GraphOptimizationContext analyses: see Rules/GatherOptimizationRule.cpp.
+  GatherOptimization = 512,
   // The following identities are owned by the layout/memory compatibility
   // passes.  They deliberately are not GraphOptimizationRule candidates and
   // are not added to GraphOptimizePass's per-function phase loop.
@@ -74,6 +79,8 @@ getGraphOptimizationRuleName(GraphOptimizationRuleId rule) {
     return "DiagonalMaskRemoval";
   case GraphOptimizationRuleId::ConvertModuloToMask:
     return "ConvertModuloToMask";
+  case GraphOptimizationRuleId::GatherOptimization:
+    return "GatherOptimization";
   case GraphOptimizationRuleId::StridedAxisCoalescing:
     return "StridedAxisCoalescing";
   case GraphOptimizationRuleId::ChunkCoalescing:
@@ -96,6 +103,7 @@ constexpr uint16_t kAllGraphOptimizationRuleMask =
     getGraphOptimizationRuleMask(GraphOptimizationRuleId::RowCoalescing) |
     getGraphOptimizationRuleMask(GraphOptimizationRuleId::DiagonalMaskRemoval) |
     getGraphOptimizationRuleMask(GraphOptimizationRuleId::ConvertModuloToMask) |
+    getGraphOptimizationRuleMask(GraphOptimizationRuleId::GatherOptimization) |
     getGraphOptimizationRuleMask(
         GraphOptimizationRuleId::StridedAxisCoalescing) |
     getGraphOptimizationRuleMask(GraphOptimizationRuleId::ChunkCoalescing) |
